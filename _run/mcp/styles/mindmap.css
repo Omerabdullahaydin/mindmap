@@ -1,0 +1,229 @@
+/* ------------------------------------------------------------------------
+   AŞAĞIDAKİ STİL BLOĞU sadece GÖRÜNÜMLE (renk, gölge, tipografi, cam efekti,
+   açık/koyu tema) ilgilidir. Mindmap'in NASIL ÇALIŞTIĞIYLA (markdown
+   ayrıştırma, tıklama davranışı vb.) ilgili DEĞİLDİR.
+
+   TASARIM YAKLAŞIMI: Tüm renkler CSS custom property (değişken) olarak
+   tanımlanıyor. Düğüm renklerini bile JS'te "açık mı koyu mu" diye kontrol
+   edip hesaplamak yerine doğrudan "var(--surface)" gibi değişken isimlerini
+   SVG'ye yazıyoruz — böylece tema değişince TARAYICI kendisi otomatik
+   olarak yeniden boyar, hiçbir yeniden çizim (re-render) gerekmez.
+
+   BU DOSYA, mindmap_visualization_server.ts tarafından her HTML üretiminde
+   mindmaps/css/mindmap.css olarak KOPYALANIR (bkz. createLiveMindmapHTML).
+   Burada değişiklik yapmak, bir sonraki üretimde otomatik yansır.
+   ------------------------------------------------------------------------ */
+:root{
+  --bg-app:#f6f7fb;
+  --surface:#ffffff;
+  --surface-2:#eef0f6;
+  --border:#e6e8f0;
+  --border-strong:#d7dbe6;
+  --text-primary:#12141c;
+  --text-secondary:#6b7280;
+  --text-tertiary:#9aa2b1;
+  --accent:#6366f1;
+  --accent-ring:rgba(99,102,241,.16);
+  --map-dot:#e2e5ee;
+  --map-bg-a:#fbfbfe;
+  --map-bg-b:#f1f3f9;
+  --blob-a:rgba(99,102,241,.07);
+  --blob-b:rgba(20,184,166,.06);
+  --root-grad-a:#6d6ff5;
+  --root-grad-b:#4436c8;
+  --toolbar-bg:rgba(255,255,255,.75);
+  --toolbar-shadow:rgba(15,23,42,.08);
+  --scrollbar-thumb:#d6dae3;
+  --scrollbar-thumb-hover:#b7bdc9;
+  --shadow-1:0 1px 2px rgba(15,23,42,.05);
+  --shadow-node-1:0 1px 2px rgba(15,23,42,.06);
+  --shadow-node-2:0 6px 16px rgba(15,23,42,.08);
+  --shadow-node-hover-1:0 2px 5px rgba(15,23,42,.10);
+  --shadow-node-hover-2:0 12px 26px rgba(15,23,42,.16);
+  --root-shadow:0 12px 28px rgba(68,54,200,.30);
+}
+[data-theme="dark"]{
+  --bg-app:#090c14;
+  --surface:#131826;
+  --surface-2:#0f1420;
+  --border:#232a3a;
+  --border-strong:#2e3648;
+  --text-primary:#eceef3;
+  --text-secondary:#8890a3;
+  --text-tertiary:#565f73;
+  --accent:#8b8ff9;
+  --accent-ring:rgba(139,143,249,.28);
+  --map-dot:#1a2032;
+  --map-bg-a:#090c14;
+  --map-bg-b:#0c1120;
+  --blob-a:rgba(99,102,241,.14);
+  --blob-b:rgba(20,184,166,.10);
+  --root-grad-a:#7d80f8;
+  --root-grad-b:#4c3fd6;
+  --toolbar-bg:rgba(11,14,23,.70);
+  --toolbar-shadow:rgba(0,0,0,.5);
+  --scrollbar-thumb:#212a3b;
+  --scrollbar-thumb-hover:#303c53;
+  --shadow-1:0 1px 2px rgba(0,0,0,.4);
+  --shadow-node-1:0 1px 2px rgba(0,0,0,.45);
+  --shadow-node-2:0 8px 18px rgba(0,0,0,.4);
+  --shadow-node-hover-1:0 2px 6px rgba(0,0,0,.5);
+  --shadow-node-hover-2:0 14px 30px rgba(0,0,0,.5);
+  --root-shadow:0 14px 30px rgba(0,0,0,.55);
+}
+
+*{box-sizing:border-box;}
+html,body{height:100%;}
+body{
+  font-family:'Inter',-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
+  -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;
+  margin:0; display:flex; flex-direction:column; height:100vh; background:var(--bg-app);
+  transition:background-color .3s ease;
+}
+
+/* ---- Üst araç çubuğu: cam efektli (frosted glass), arama, yakınlaştırma,
+   daralt/genişlet, tema, dışa aktar ---- */
+#toolbar{
+  flex:0 0 58px; display:flex; align-items:center; gap:10px;
+  padding:0 18px; background:var(--toolbar-bg);
+  backdrop-filter:blur(18px) saturate(160%); -webkit-backdrop-filter:blur(18px) saturate(160%);
+  border-bottom:1px solid var(--border); color:var(--text-secondary);
+  box-shadow:0 8px 24px -14px var(--toolbar-shadow); position:relative; z-index:5;
+  transition:background-color .25s ease, border-color .25s ease;
+}
+.tb-logo{
+  font-weight:800; font-size:14.5px; white-space:nowrap; display:flex; align-items:center; gap:8px;
+  color:var(--text-primary); letter-spacing:-.1px;
+}
+.tb-logo-badge{
+  width:27px; height:27px; border-radius:8px; display:flex; align-items:center; justify-content:center;
+  font-size:13px; background:linear-gradient(135deg,var(--root-grad-a),var(--root-grad-b));
+  box-shadow:0 3px 10px var(--accent-ring);
+}
+/* Düğme grupları tek bir "segmented control" kapsülü içinde: aralarında
+   ayraç yerine ortak nötr bir arka plan var, düğmeler sadece hover'da belirginleşir. */
+.tb-group{
+  display:flex; align-items:center; gap:2px; background:var(--surface-2); border-radius:10px; padding:3px;
+  transition:background-color .25s ease;
+}
+.tb-sep{width:1px; height:22px; background:var(--border); margin:0 2px; flex:0 0 auto;}
+.tb-spacer{flex:1;}
+.tb-btn{
+  border:1px solid transparent; background:transparent; color:var(--text-secondary);
+  padding:6px 11px; border-radius:7px; cursor:pointer; font-size:12.5px; font-weight:600;
+  white-space:nowrap; transition:background-color .15s ease, color .15s ease, transform .1s ease, box-shadow .15s ease;
+}
+.tb-btn:hover{ background:var(--surface); color:var(--text-primary); box-shadow:var(--shadow-1); }
+.tb-btn:active{ transform:scale(.94); }
+.zoom-level{font-size:12px; color:var(--text-tertiary); min-width:38px; text-align:center; display:inline-block;}
+.search-wrap{position:relative; display:flex; align-items:center;}
+.search-icon{ position:absolute; left:11px; font-size:12.5px; opacity:.5; pointer-events:none; }
+#searchInput{
+  width:200px; padding:8px 12px 8px 30px; border-radius:9px; border:1px solid transparent;
+  background:var(--surface-2); color:var(--text-primary); font-size:13px; outline:none;
+  transition:box-shadow .15s ease, background-color .15s ease, border-color .15s ease;
+}
+#searchInput::placeholder{ color:var(--text-tertiary); }
+#searchInput:focus{ background:var(--surface); border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-ring); }
+.search-count{font-size:11px; color:var(--text-tertiary); margin-left:8px; white-space:nowrap;}
+.stats{
+  font-size:12px; color:var(--text-secondary); white-space:nowrap;
+  background:var(--surface-2); padding:5px 12px; border-radius:9px;
+  transition:background-color .25s ease;
+}
+
+/* ---- İçerik alanı: soldaki markdown editörü + sağdaki mindmap tuvali ---- */
+#content{flex:1; display:flex; min-height:0;}
+#editorPane{
+  width:38%; height:100%; display:flex; flex-direction:column;
+  border-right:1px solid var(--border); background:var(--surface);
+  transition:width .2s ease, opacity .2s ease, background-color .25s ease, border-color .25s ease;
+}
+.editor-header{
+  flex:0 0 auto; padding:12px 20px; font-size:10.5px; font-weight:700; letter-spacing:.8px;
+  text-transform:uppercase; color:var(--text-tertiary);
+  border-bottom:1px solid var(--border);
+  transition:color .25s ease, border-color .25s ease;
+}
+#editor{
+  flex:1; width:100%; padding:18px 20px; border:none; margin:0;
+  resize:none; font-family:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;
+  font-size:13px; line-height:1.75; color:var(--text-primary); background:transparent; outline:none;
+  transition:color .25s ease;
+}
+#editor::-webkit-scrollbar{ width:10px; }
+#editor::-webkit-scrollbar-track{ background:transparent; }
+#editor::-webkit-scrollbar-thumb{ background:var(--scrollbar-thumb); border-radius:8px; border:2px solid var(--surface); }
+#editor::-webkit-scrollbar-thumb:hover{ background:var(--scrollbar-thumb-hover); }
+/* "Editörü göster/gizle" düğmesiyle eklenen sınıf: editörü tamamen daraltır,
+   haritaya tüm genişliği bırakır. */
+#editorPane.collapsed{width:0; opacity:0; overflow:hidden; border:none;}
+
+/* Harita tuvali: ince nokta dokusu + iki hafif renkli "blob" (çok düşük
+   opaklıkta) ile modern, derinlikli ama abartısız bir arka plan. */
+#map{
+  flex:1; height:100%;
+  background:
+    radial-gradient(circle,var(--map-dot) 1px,transparent 1px) 0 0/24px 24px,
+    radial-gradient(640px circle at 12% 15%, var(--blob-a), transparent 60%),
+    radial-gradient(560px circle at 88% 85%, var(--blob-b), transparent 60%),
+    linear-gradient(160deg,var(--map-bg-a),var(--map-bg-b));
+}
+.node rect.card-rect{
+  cursor:pointer;
+  filter: drop-shadow(var(--shadow-node-1)) drop-shadow(var(--shadow-node-2));
+  transition: filter .18s ease, opacity .15s ease;
+}
+.node:hover rect.card-rect{ filter: drop-shadow(var(--shadow-node-hover-1)) drop-shadow(var(--shadow-node-hover-2)); }
+.node text{ pointer-events:none; overflow:hidden; }
+/* Yeni çizilen düğümler aniden belirmek yerine hafifçe belirir (yalnızca
+   opacity animasyonu — konumu belirleyen SVG transform attribute'una
+   ASLA dokunmuyoruz, yoksa düğümler orijine sıçrar). */
+@keyframes nodeIn{ from{opacity:0;} to{opacity:1;} }
+@keyframes linkIn{ from{opacity:0;} to{opacity:1;} }
+.node{ animation:nodeIn .35s ease; transition: opacity .15s ease; }
+/* Arama kutusuna yazınca eşleşmeyen düğümler soluklaşır (.dim),
+   eşleşenler ise hafif bir vurgu halkası kazanır (.match). */
+.node.dim{ opacity:.22; }
+.node.match rect.card-rect{ stroke:var(--accent) !important; stroke-width:2 !important; }
+.link{ fill:none; stroke-linecap:round; animation:linkIn .4s ease; }
+
+/* ---- Dal daralt/genişlet düğmesi: her ana düğümün dış kenarındaki küçük yuvarlak ---- */
+.collapse-toggle{ cursor:pointer; }
+.collapse-toggle circle{ fill:var(--surface); stroke:var(--border-strong); stroke-width:1.5; transition:stroke .15s ease; }
+.collapse-toggle:hover circle{ stroke:var(--accent); }
+.collapse-toggle text{ font-size:11px; font-weight:700; fill:var(--text-secondary); text-anchor:middle; pointer-events:none; }
+
+/* ---- Kaynak (citation) modalı: bir düğüme tıklayınca açılan pencere.
+   Bilinçli olarak ana temadan (açık/koyu) BAĞIMSIZ, hep açık renkli — bu
+   yüzden var(--surface) gibi tema değişkenlerini değil, sabit renkler
+   kullanıyor. Önceden bu bloklar mindmap_visualization_server.ts içinde
+   her HTML parçasının üzerinde tek tek style="..." olarak dağınık haldeydi;
+   artık tek bir yerde toplandı. ---- */
+.citation-modal{
+  display:none; position:fixed; top:50%; left:50%; transform:translate(-50%,-50%);
+  background:#ffffff; padding:30px; border-radius:16px; box-shadow:0 20px 60px rgba(30,41,59,.25);
+  max-width:700px; max-height:80vh; overflow-y:auto; z-index:10000;
+  font-family:'Inter',-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
+}
+.citation-modal.is-open{ display:block; }
+.citation-modal-header{
+  display:flex; justify-content:space-between; align-items:center;
+  margin-bottom:20px; border-bottom:2px solid #4f46e5; padding-bottom:10px;
+}
+.citation-modal-header h3{ margin:0; color:#4f46e5; }
+.citation-modal-close{
+  background:#eef2ff; color:#4f46e5; border:none; padding:8px 16px; border-radius:8px;
+  cursor:pointer; font-size:16px; font-weight:bold;
+}
+.citation-overlay{
+  display:none; position:fixed; inset:0; background:rgba(15,23,42,.45);
+  backdrop-filter:blur(2px); z-index:9999;
+}
+.citation-overlay.is-open{ display:block; }
+.citation-body{ font-family:sans-serif; }
+.citation-lead{ margin-bottom:15px; color:#666; font-size:14px; }
+.citation-card{ margin:15px 0; padding:15px; background:#f8fafc; border-left:4px solid #4f46e5; border-radius:8px; }
+.citation-card-title{ color:#4f46e5; }
+.citation-meta{ color:#555; }
+.citation-quote{ margin-top:10px; padding:10px; background:#ffffff; border-radius:4px; font-style:italic; color:#555; }

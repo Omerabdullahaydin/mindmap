@@ -1,0 +1,704 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Live D3 Mindmap</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<!-- Görünümle ilgili TÜM stiller tek bir dosyada: mcp/styles/mindmap.css.
+     Üretilen her HTML mindmaps/ klasörüne yazıldığı için, buradan
+     mcp/styles/'a giden göreli yol hep "../mcp/styles/..." olur. Kopya
+     dosya YOK — tek bir mindmap.css var, iki yerde aynı içeriği elde tutup
+     senkron kalmaya çalışmak yerine doğrudan kaynağına bağlanıyoruz. -->
+<link rel="stylesheet" href="../mcp/styles/mindmap.css">
+<script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
+</head>
+<body>
+<div id="toolbar">
+  <div class="tb-logo"><span class="tb-logo-badge">🧠</span> Mindmap</div>
+  <div class="tb-sep"></div>
+  <div class="search-wrap">
+    <span class="search-icon">🔍</span>
+    <input id="searchInput" type="text" placeholder="Düğümlerde ara..." />
+  </div>
+  <span id="searchCount" class="search-count"></span>
+  <div class="tb-spacer"></div>
+  <span id="statsLabel" class="stats"></span>
+  <div class="tb-group">
+    <button id="btnExpandAll" class="tb-btn" title="Tüm dalları genişlet">⊞ Genişlet</button>
+    <button id="btnCollapseAll" class="tb-btn" title="Tüm dalları daralt">⊟ Daralt</button>
+  </div>
+  <div class="tb-group">
+    <button id="btnZoomOut" class="tb-btn" title="Uzaklaştır">−</button>
+    <span id="zoomLevel" class="zoom-level">100%</span>
+    <button id="btnZoomIn" class="tb-btn" title="Yakınlaştır">+</button>
+    <button id="btnFit" class="tb-btn" title="Ekrana sığdır">⤢ Sığdır</button>
+  </div>
+  <div class="tb-group">
+    <button id="btnToggleEditor" class="tb-btn" title="Editörü göster/gizle">📝 Editör</button>
+    <button id="btnExportPng" class="tb-btn" title="PNG olarak indir">⬇ PNG</button>
+    <button id="btnTheme" class="tb-btn" title="Açık/koyu tema">🌙</button>
+  </div>
+</div>
+<div id="content">
+<div id="editorPane">
+  <div class="editor-header">📝 Markdown Editörü</div>
+  <textarea id="editor"># Test
+## 1. Cat (1:00)
+- 1.1 Item A
+- 1.2 Item B</textarea>
+</div>
+<svg id="map"></svg>
+</div>
+<script>
+
+// ---------- Markdown -> Tree parser ----------
+function mdToTree(markdown) {
+  const lines = markdown.split(/\r?\n/).map(l=>l.replace(/\t/g,'    '));
+  const root={id:'root',topic:'Root',children:[]};
+  let stack=[{level:0,node:root}];
+  for(let raw of lines){
+    const line=raw.trim();
+    if(!line) continue;
+    const m=line.match(/^(#{1,6})\s+(.*)/);
+    if(m){
+      const lvl=m[1].length,text=m[2].trim();
+      if(lvl===1){
+        root.topic=text;
+        continue;
+      }
+      const node={id:Math.random().toString(36).slice(2,9),topic:text,children:[]};
+      while(stack.length && stack[stack.length-1].level>=lvl) stack.pop();
+      stack[stack.length-1].node.children.push(node);
+      stack.push({level:lvl,node});
+      continue;
+    }
+    const lm=line.match(/^[-*+]\s+(.*)/);
+    if(lm){stack[stack.length-1].node.children.push({id:Math.random().toString(36).slice(2,9),topic:lm[1].trim(),children:[]}); continue;}
+  }
+  return root;
+}
+
+// ============================================================================
+// BRANCH_COLORS + splitLeftRight + markSide: her ana dalın (kökten çıkan ilk
+// kategorilerin) kendi "vurgu" (accent) rengini alması ve bu rengin, o dalın
+// ALTINDAKİ TÜM alt maddelere de miras kalması için. Kartların kendisi artık
+// NÖTR (var(--surface)) — renk sadece ince bir kenar çubuğu ve bağlantı
+// çizgilerinde kullanılıyor. Bu sayede tek bir hex yeterli, açık/koyu tema
+// için ayrı bir versiyon tutmaya gerek yok (nötr renkler zaten CSS
+// değişkeniyle otomatik değişiyor).
+// ============================================================================
+const BRANCH_COLORS=['#6366f1','#14b8a6','#f59e0b','#f43f5e','#10b981','#8b5cf6','#fb923c','#0ea5e9'];
+
+function splitLeftRight(root){
+  if(!root.children || root.children.length===0) return root;
+  root.left=[];
+  root.right=[];
+  root.children.forEach((n,i)=>{
+    const branch=BRANCH_COLORS[i%BRANCH_COLORS.length];
+    if(i%2===0){
+      root.left.push(n);
+      n._side='left';
+      markSide(n,'left',branch);
+    }else{
+      root.right.push(n);
+      n._side='right';
+      markSide(n,'right',branch);
+    }
+  });
+  return root;
+}
+function markSide(node,side,branch){
+  node._side=side;
+  node._branch=branch;
+  if(node.children) node.children.forEach(c=>markSide(c,side,branch));
+}
+
+// ---------- Yardımcılar: tema (sadece PNG dışa aktarımı için), istatistik ----------
+function isDarkTheme(){
+  return document.documentElement.getAttribute('data-theme')==='dark';
+}
+// countStats: ağacın TAMAMINI (daraltılmış dallar dahil) sayar, çünkü bu
+// içeriğin gerçek boyutunu gösterir, o an ekranda görünenin değil.
+function countStats(node){
+  let items=0;
+  const branches = node.children ? node.children.length : 0;
+  (function walk(n){
+    if(n.children){ n.children.forEach(c=>{ items++; walk(c); }); }
+  })(node);
+  return {branches:branches, items:items};
+}
+
+// ---------- Render ----------
+const svg=d3.select('#map');
+
+// Kök düğüme gradyan dolgu + hafif bir "glow" (parıltı) vermek için bir kere
+// tanımlanan <defs>. gMain'in İÇİNDE değil, svg'nin doğrudan altında —
+// çünkü her renderTree çağrısında gMain.selectAll('*').remove() çalışıyor
+// ve bu defs'i silmemesi gerekiyor. Gradyan durakları CSS değişkenlerine
+// bağlı (style="stop-color:var(...)"), yani tema değişince bunlar da
+// otomatik güncellenir.
+const defs=svg.append('defs');
+defs.append('radialGradient')
+  .attr('id','rootGradient').attr('cx','35%').attr('cy','32%').attr('r','75%')
+  .selectAll('stop')
+  .data([{offset:'0%',key:'--root-grad-a'},{offset:'100%',key:'--root-grad-b'}])
+  .join('stop')
+  .attr('offset',d=>d.offset)
+  .attr('style',d=>'stop-color:var('+d.key+')');
+const glowFilter=defs.append('filter')
+  .attr('id','rootGlow').attr('x','-60%').attr('y','-60%').attr('width','220%').attr('height','220%');
+glowFilter.append('feGaussianBlur').attr('stdDeviation','6').attr('result','blur');
+const glowMerge=glowFilter.append('feMerge');
+glowMerge.append('feMergeNode').attr('in','blur');
+glowMerge.append('feMergeNode').attr('in','SourceGraphic');
+
+const gMain=svg.append('g');
+
+let width=0, height=0;
+function resizeSvg(){
+  const mapEl=document.getElementById('map');
+  width = mapEl.clientWidth || window.innerWidth;
+  height = mapEl.clientHeight || window.innerHeight;
+  svg.attr('width',width).attr('height',height);
+}
+resizeSvg();
+window.addEventListener('resize', resizeSvg);
+
+function updateZoomLevelLabel(k){
+  const el=document.getElementById('zoomLevel');
+  if(el) el.textContent = Math.round(k*100)+'%';
+}
+const zoom=d3.zoom().scaleExtent([0.2,3]).on('zoom',event=>{
+  gMain.attr('transform',event.transform);
+  updateZoomLevelLabel(event.transform.k);
+});
+svg.call(zoom);
+
+// fitToScreen: mevcut ağacın tamamını (getBBox ile ölçüp) ekrana sığacak
+// şekilde ortalar ve ölçekler.
+function fitToScreen(){
+  const node=gMain.node();
+  if(!node) return;
+  const bbox=node.getBBox();
+  if(!bbox.width || !bbox.height) return;
+  const padding=60;
+  const scale=Math.min((width-padding)/bbox.width,(height-padding)/bbox.height,2);
+  const tx=width/2-(bbox.x+bbox.width/2)*scale;
+  const ty=height/2-(bbox.y+bbox.height/2)*scale;
+  svg.transition().duration(500).call(zoom.transform,d3.zoomIdentity.translate(tx,ty).scale(scale));
+}
+
+let cachedTreeData=null;
+let lastMarkdown='';
+let currentSearch='';
+
+function renderTree(md,opts){
+  opts=opts||{};
+  const forceRefresh=!!opts.forceRefresh;
+  const recenter=opts.recenter!==false;
+
+  if(md!==lastMarkdown || forceRefresh || !cachedTreeData){
+    cachedTreeData=splitLeftRight(mdToTree(md));
+    lastMarkdown=md;
+  }
+  const treeData=cachedTreeData;
+
+  const tree=d3.tree()
+    .nodeSize([60,220])
+    .separation((a,b)=>a.parent===b.parent?1:1.5);
+
+  // Daraltılmış (_collapsed) düğümlerin çocukları hiyerarşiye hiç girmez,
+  // böylece o dal ekrandan tamamen kaybolur ama veri (node.children) korunur.
+  const hierarchy=d3.hierarchy(treeData,d=>d._collapsed?null:d.children);
+  tree(hierarchy);
+
+  const nodes=hierarchy.descendants();
+  const links=hierarchy.links();
+
+  nodes.forEach(d=>{
+    if(d.data._side==='left'){
+      d.y=-Math.abs(d.y);
+    }
+    if(d.depth===0){
+      d.y=0;
+    }
+  });
+
+  gMain.selectAll('*').remove();
+
+  gMain.append('g').selectAll('path.link')
+    .data(links)
+    .join('path')
+    .attr('class','link')
+    .attr('d',d=>{
+      const s=d.source;
+      const t=d.target;
+      const mx=(s.y+t.y)/2;
+      return `M${s.y},${s.x} C${mx},${s.x} ${mx},${t.x} ${t.y},${t.x}`;
+    })
+    .attr('stroke',d=>d.target.data._branch||'var(--text-tertiary)')
+    .attr('stroke-opacity',0.45)
+    .attr('stroke-width',d=>Math.max(1.4,2.6-d.target.depth*0.35));
+
+  const node=gMain.append('g').selectAll('g.node')
+    .data(nodes)
+    .join('g')
+    .attr('class','node')
+    .attr('transform',d=>`translate(${d.y},${d.x})`)
+    .style('cursor','pointer');
+
+  node.append('title').text(d=>d.data.topic);
+
+  const textEl=node.append('text')
+    .attr('dy','0.35em')
+    .attr('text-anchor','middle')
+    .text(d=>d.data.topic)
+    .style('font-size',d=>d.depth===0?'17px':d.depth===1?'14px':'13px')
+    .style('font-weight',d=>d.depth===0?'700':d.depth===1?'700':'500')
+    .style('fill',d=>d.depth===0?'#ffffff':'var(--text-primary)')
+    .style('pointer-events','none');
+
+  const minWidth=120;
+  const maxWidth=250;
+  const maxCharsPerLine=35;
+  const maxLines=3;
+
+  textEl.each(function(d){
+    const text=d3.select(this);
+    let fullText=d.data.topic;
+    let words=fullText.split(/\s+/);
+
+    const processedWords=[];
+    words.forEach(word=>{
+      if(word.length>maxCharsPerLine){
+        for(let i=0;i<word.length;i+=maxCharsPerLine){
+          processedWords.push(word.substring(i,i+maxCharsPerLine));
+        }
+      }else{
+        processedWords.push(word);
+      }
+    });
+
+    words=processedWords.reverse();
+    let word;
+    let line=[];
+    let lineNumber=0;
+    let maxLineWidth=0;
+    const lineHeight=1.1;
+    const firstTspan=text.text(null).append('tspan').attr('x',0).attr('dy','0.35em');
+    let tspan=firstTspan;
+
+    while(word=words.pop()){
+      if(lineNumber>=maxLines-1 && words.length>0){
+        tspan.text(line.join(' ')+'...');
+        maxLineWidth=Math.max(maxLineWidth,tspan.node().getComputedTextLength());
+        break;
+      }
+
+      line.push(word);
+      tspan.text(line.join(' '));
+      const currentWidth=tspan.node().getComputedTextLength();
+
+      if(currentWidth>maxWidth){
+        if(line.length>1){
+          line.pop();
+          tspan.text(line.join(' '));
+          maxLineWidth=Math.max(maxLineWidth,tspan.node().getComputedTextLength());
+          line=[word];
+          tspan=text.append('tspan').attr('x',0).attr('dy',lineHeight+'em').text(word);
+          lineNumber++;
+        }else{
+          maxLineWidth=Math.max(maxLineWidth,currentWidth);
+          line=[];
+          tspan=text.append('tspan').attr('x',0).attr('dy',lineHeight+'em').text('');
+          lineNumber++;
+        }
+      }else{
+        maxLineWidth=Math.max(maxLineWidth,currentWidth);
+      }
+    }
+
+    // ÖNEMLİ: Yukarıdaki döngü her yeni satırı bir öncekinin ALTINA ekliyor
+    // (dy=+1.1em), yani metin bloğu SADECE AŞAĞI doğru büyüyor. Tek satırlık
+    // metinlerde "dy=0.35em" düğümü dikeyde ortalar, ama 2-3 satıra
+    // wrap olduğunda blok artık merkezin çoğunlukla ALTINDA kalıyor ve
+    // (özellikle kök düğümün büyük fontunda) kutunun alt kenarından taşıyor.
+    // Düzeltme: ilk satırın dy'sini, TÜM bloğu (satır sayısına göre) yukarı
+    // kaydıracak şekilde yeniden hesaplıyoruz — böylece blok, tek satırda
+    // olduğu gibi düğümün dikey merkezine göre simetrik kalıyor.
+    const totalLines=lineNumber+1;
+    const centerShift=(totalLines-1)*lineHeight/2;
+    firstTspan.attr('dy',(0.35-centerShift)+'em');
+
+    d.data._lineCount=totalLines;
+    d.data._boxWidth=Math.max(minWidth,Math.min(maxWidth,maxLineWidth+30));
+  });
+
+  // Ana kart: nötr yüzey rengi (var(--surface)), ince nötr kenarlık. Kök
+  // için gradyan dolgu + glow (bkz. üstteki <defs>).
+  node.insert('rect','text')
+    .attr('class','card-rect')
+    .attr('x',d=>-(d.data._boxWidth||minWidth)/2)
+    .attr('y',d=>-((d.data._lineCount||1)*12))
+    .attr('width',d=>d.data._boxWidth||minWidth)
+    .attr('height',d=>(d.data._lineCount||1)*22+6)
+    .attr('rx',d=>d.depth===0?20:10)
+    .attr('ry',d=>d.depth===0?20:10)
+    .style('fill',d=>d.depth===0?'url(#rootGradient)':'var(--surface)')
+    .style('stroke',d=>d.depth===0?'var(--root-grad-b)':'var(--border)')
+    .style('stroke-width',d=>d.depth===0?0:1)
+    .style('filter',d=>d.depth===0?'url(#rootGlow) drop-shadow(var(--root-shadow))':null);
+
+  // Sol kenar vurgu çubuğu: kartın kendi rengi nötr kaldığı için, hangi dala
+  // ait olduğunu ince, renkli bir şerit gösterir (Linear/Notion tarzı kart
+  // tasarımı) — tüm metni boyamak yerine daha sakin/profesyonel bir görünüm.
+  node.filter(d=>d.depth>0 && !!d.data._branch)
+    .insert('rect','text')
+    .attr('x',d=>-(d.data._boxWidth||minWidth)/2)
+    .attr('y',d=>-((d.data._lineCount||1)*12))
+    .attr('width',d=>d.depth===1?4:3)
+    .attr('height',d=>(d.data._lineCount||1)*22+6)
+    .attr('rx',2).attr('ry',2)
+    .style('fill',d=>d.data._branch)
+    .style('opacity',d=>d.depth===1?1:0.55);
+
+  // ---- Daralt/genişlet düğmesi: sadece çocuğu olan ve kök OLMAYAN düğümlere
+  // eklenir (kökü tek tıkla tamamen gizlemek kafa karıştırıcı olurdu).
+  // Düğme, dalın kökten UZAKLAŞAN kenarına (sol dallarda sola, sağ dallarda
+  // sağa) yerleştirilir, böylece o dalın devamı gibi okunur.
+  const toggle=node.filter(d=>d.depth>0 && d.data.children && d.data.children.length>0)
+    .append('g')
+    .attr('class','collapse-toggle')
+    .attr('transform',d=>{
+      const bw=(d.data._boxWidth||minWidth)/2;
+      const side=d.data._side==='left'?-1:1;
+      return 'translate('+(side*(bw+14))+',0)';
+    })
+    .on('click',function(event,d){
+      event.stopPropagation();
+      d.data._collapsed=!d.data._collapsed;
+      renderTree(editor.value,{recenter:false});
+    });
+  toggle.append('circle').attr('r',9);
+  toggle.append('text').attr('dy','0.32em').text(d=>d.data._collapsed?'+':'−');
+  toggle.append('title').text(d=>d.data._collapsed?('Genişlet ('+d.data.children.length+')'):'Daralt');
+
+  const stats=countStats(treeData);
+  const statsEl=document.getElementById('statsLabel');
+  if(statsEl) statsEl.textContent=stats.branches+' ana dal · '+stats.items+' madde';
+
+  if(recenter){
+    svg.transition().duration(500).call(zoom.transform,d3.zoomIdentity.translate(width/2,height/2));
+  }
+
+  applySearchHighlight();
+}
+
+// ---------- Arama: yazdıkça eşleşen düğümleri vurgular, diğerlerini soluklaştırır ----------
+function applySearchHighlight(){
+  const q=currentSearch.trim().toLowerCase();
+  const nodeSel=gMain.selectAll('g.node');
+  const countEl=document.getElementById('searchCount');
+  if(!q){
+    nodeSel.classed('dim',false).classed('match',false);
+    if(countEl) countEl.textContent='';
+    return;
+  }
+  let matchCount=0;
+  nodeSel.each(function(d){
+    const txt=(d.data.topic||'').toLowerCase();
+    const isMatch=txt.indexOf(q)!==-1;
+    if(isMatch) matchCount++;
+    d3.select(this).classed('match',isMatch).classed('dim',!isMatch);
+  });
+  if(countEl) countEl.textContent = matchCount>0 ? (matchCount+' eşleşme') : 'Eşleşme yok';
+}
+
+// bakeComputedStyles: "liveRoot" (canlı, ekrandaki SVG) ile "cloneRoot"
+// (cloneNode(true) ile üretilmiş TIPATIP AYNI YAPIDA bir kopya) içindeki
+// her öğeyi SIRAYLA eşleştirir ve canlı öğenin gerçek (computed) fill/
+// stroke/opacity/filter değerlerini klonun İÇİNE sabit (inline) stil olarak
+// yazar. cloneNode(true) öğe sırasını/sayısını birebir koruduğu için bu
+// indeks eşlemesi güvenlidir — YETER Kİ bu fonksiyon, klona başka öğeler
+// (ör. <style>, arka plan <rect>'i) eklenmeden ÖNCE çağrılsın.
+function bakeComputedStyles(liveRoot,cloneRoot){
+  const PROPS=['fill','stroke','opacity','stroke-width','stroke-opacity','filter','stop-color'];
+  const liveEls=liveRoot.querySelectorAll('*');
+  const cloneEls=cloneRoot.querySelectorAll('*');
+  liveEls.forEach(function(el,i){
+    const target=cloneEls[i];
+    if(!target) return;
+    const cs=getComputedStyle(el);
+    let extra='';
+    PROPS.forEach(function(p){ extra+=p+':'+cs.getPropertyValue(p)+';'; });
+    target.setAttribute('style',(target.getAttribute('style')||'')+';'+extra);
+  });
+}
+
+// ---------- PNG olarak dışa aktarma ----------
+// Mevcut haritanın SVG'sini klonlayıp, canlı görünümün gerçek (computed)
+// renklerini klona gömüp, bir <img>/<canvas> üzerinden PNG'ye çeviriyoruz.
+// Böylece tarayıcı dışına çıkmadan, sunucu gerektirmeden dosya indirilebiliyor.
+function exportPng(){
+  const svgEl=document.getElementById('map');
+  const bbox=gMain.node().getBBox();
+  if(!bbox.width || !bbox.height) return;
+  const padding=40;
+  const totalWidth=bbox.width+padding*2;
+  const totalHeight=bbox.height+padding*2;
+
+  const clone=svgEl.cloneNode(true);
+  clone.setAttribute('xmlns','http://www.w3.org/2000/svg');
+  clone.setAttribute('width',totalWidth);
+  clone.setAttribute('height',totalHeight);
+  clone.setAttribute('viewBox',(bbox.x-padding)+' '+(bbox.y-padding)+' '+totalWidth+' '+totalHeight);
+  // Düğüm renkleri var(--surface) gibi CSS değişkenlerine bağlı. Klonlanan
+  // SVG kendi başına (ayrı bir mini-belge gibi) çizileceği için, mevcut
+  // temayı ("dark"/"light") doğrudan klonun KÖKÜNE yazmamız gerekiyor —
+  // yoksa [data-theme="dark"] kuralı eşleşecek bir üst öğe bulamaz ve
+  // dışa aktarılan PNG her zaman açık temayla çizilir.
+  clone.setAttribute('data-theme',isDarkTheme()?'dark':'light');
+
+  // ---- ÖNEMLİ: renkleri CSS dosyasından KOPYALAMAYA güvenmek yerine,
+  // TARAYICININ ZATEN HESAPLADIĞI (computed) renkleri doğrudan klona gömüyoruz.
+  // Neden? CSS'i ayrı bir dosyaya (css/mindmap.css) taşıdıktan sonra, bu
+  // sayfa file:// üzerinden açıldığında tarayıcılar (Chrome/Edge) harici
+  // <link> stylesheet'lerin cssRules'unu OKUMAYI güvenlik gereği engelliyor
+  // ("Cannot access rules" hatası) — bu yüzden var(--surface) gibi
+  // değişkenlere bağlı renkler dışa aktarılan PNG'de HİÇ görünmüyordu
+  // (kartlar simsiyah, yazılar görünmez çıkıyordu). getComputedStyle ise
+  // stil kaynağı ne olursa olsun (inline/dahili/harici) her zaman çalışır,
+  // çünkü CSS dosyasını yeniden OKUMAYA değil, tarayıcının halihazırda
+  // hesapladığı sonuca bakıyor. Klon, cloneNode(true) ile birebir aynı
+  // sırada üretildiği için canlı ve klon ağaçlarını indeks indekse eşleyip
+  // her öğenin gerçek rengini klona "sabit" (inline) olarak yazabiliyoruz.
+  bakeComputedStyles(svgEl,clone);
+
+  // Klondaki ana <g>'nin pan/zoom transform'unu sıfırla: yeni viewBox zaten
+  // düğümlerin kendi (dönüşümsüz) koordinatlarını temel alıyor.
+  const innerG=clone.querySelector('g');
+  if(innerG) innerG.removeAttribute('transform');
+
+  // ÖNEMLİ: .node/.link için tanımlı "nodeIn/linkIn" giriş animasyonu
+  // (opacity 0 -> 1) burada KAPATILMALI. Aksi halde bu SVG bir <img>'e taze
+  // bir belge olarak yüklendiğinde animasyon baştan (t=0, yani opacity:0)
+  // başlar ve canvas'a o ilk kare (bomboş/görünmez düğümler) yakalanır.
+  // (Diğer TÜM renkler zaten yukarıdaki bakeComputedStyles ile sabitlendiği
+  // için, buraya harici CSS dosyasının tamamını gömmeye gerek yok.)
+  const styleEl=document.createElementNS('http://www.w3.org/2000/svg','style');
+  styleEl.textContent='.node,.link{animation:none !important;}';
+  clone.insertBefore(styleEl,clone.firstChild);
+
+  const isDark=isDarkTheme();
+  const bgRect=document.createElementNS('http://www.w3.org/2000/svg','rect');
+  bgRect.setAttribute('x',bbox.x-padding);
+  bgRect.setAttribute('y',bbox.y-padding);
+  bgRect.setAttribute('width',totalWidth);
+  bgRect.setAttribute('height',totalHeight);
+  bgRect.setAttribute('fill',isDark?'#090c14':'#fbfbfe');
+  clone.insertBefore(bgRect,styleEl.nextSibling);
+
+  const svgString=new XMLSerializer().serializeToString(clone);
+  const svgBlob=new Blob([svgString],{type:'image/svg+xml;charset=utf-8'});
+  const url=URL.createObjectURL(svgBlob);
+  const img=new Image();
+  img.onload=function(){
+    const scaleFactor=2;
+    const canvas=document.createElement('canvas');
+    canvas.width=totalWidth*scaleFactor;
+    canvas.height=totalHeight*scaleFactor;
+    const ctx=canvas.getContext('2d');
+    ctx.scale(scaleFactor,scaleFactor);
+    ctx.drawImage(img,0,0);
+    URL.revokeObjectURL(url);
+    canvas.toBlob(function(blob){
+      const a=document.createElement('a');
+      a.download='mindmap.png';
+      a.href=URL.createObjectURL(blob);
+      a.click();
+    });
+  };
+  img.src=url;
+}
+
+// ---------- Tüm dalları daralt/genişlet ----------
+function setCollapsedAll(val){
+  (function walk(n){
+    if(n.children && n.children.length){
+      if(n!==cachedTreeData) n._collapsed=val;
+      n.children.forEach(walk);
+    }
+  })(cachedTreeData);
+  renderTree(editor.value,{recenter:false});
+}
+
+// ---------- Araç çubuğu olayları ----------
+const editor=document.getElementById('editor');
+editor.addEventListener('input',function(){
+  renderTree(editor.value);
+});
+
+document.getElementById('searchInput').addEventListener('input',function(e){
+  currentSearch=e.target.value;
+  applySearchHighlight();
+});
+
+document.getElementById('btnExpandAll').addEventListener('click',()=>setCollapsedAll(false));
+document.getElementById('btnCollapseAll').addEventListener('click',()=>setCollapsedAll(true));
+
+document.getElementById('btnZoomIn').addEventListener('click',()=>{
+  svg.transition().duration(200).call(zoom.scaleBy,1.25);
+});
+document.getElementById('btnZoomOut').addEventListener('click',()=>{
+  svg.transition().duration(200).call(zoom.scaleBy,0.8);
+});
+document.getElementById('btnFit').addEventListener('click',fitToScreen);
+
+document.getElementById('btnToggleEditor').addEventListener('click',()=>{
+  document.getElementById('editorPane').classList.toggle('collapsed');
+  setTimeout(()=>{ resizeSvg(); fitToScreen(); },220);
+});
+
+document.getElementById('btnExportPng').addEventListener('click',exportPng);
+
+// Tema geçişi artık SADECE bir CSS değişkeni bayrağı (data-theme attribute'u)
+// değiştiriyor. Düğüm renkleri zaten var(--surface) / var(--text-primary)
+// gibi değişkenlere bağlı olduğu için tarayıcı her şeyi KENDİSİ, anında
+// yeniden boyar — renkleri yeniden hesaplamak için renderTree'yi tekrar
+// çağırmaya (ve haritanın görünümünü/zoom'unu sıfırlamaya) hiç gerek yok.
+document.getElementById('btnTheme').addEventListener('click',function(){
+  const root=document.documentElement;
+  const goingDark=root.getAttribute('data-theme')!=='dark';
+  root.setAttribute('data-theme',goingDark?'dark':'light');
+  this.textContent=goingDark?'☀️':'🌙';
+});
+
+// Initial render
+renderTree(editor.value);
+
+// ---- ÖNEMLİ: Web fontu (Inter) yükleme yarışı düzeltmesi ----
+// Kutu genişlikleri, yazının GERÇEK piksel genişliğine göre hesaplanıyor
+// (bkz. yukarıdaki getComputedTextLength). Ama sayfa ilk açıldığında Inter
+// fontu henüz CDN'den inmemiş olabilir; tarayıcı o an için GEÇİCİ bir yedek
+// fontla ölçüm yapar (genelde biraz daha dar). Inter indikten sonra yazı
+// GERÇEK fontla yeniden çizilir — ki bu genelde biraz daha geniştir — ve
+// önceden dar hesaplanan kutudan taşar. document.fonts.ready, Inter TAM
+// olarak kullanılabilir hale gelince çözülen bir Promise'tir; o an ağacı
+// (yapıyı bozmadan, sadece ölçümleri tazeleyerek) yeniden çizmek bu
+// taşmayı ortadan kaldırır.
+if(document.fonts && document.fonts.ready){
+  document.fonts.ready.then(function(){
+    renderTree(editor.value,{forceRefresh:true,recenter:false});
+  });
+}
+
+</script>
+
+  <!-- Citation Modal -->
+  <div id="citationModal" class="citation-modal">
+    <div class="citation-modal-header">
+      <h3>📚 Kaynaklar</h3>
+      <button onclick="closeCitationModal()" class="citation-modal-close">✕</button>
+    </div>
+    <div id="citationContent"></div>
+  </div>
+  <div id="citationOverlay" class="citation-overlay" onclick="closeCitationModal()"></div>
+
+  <script>
+    // Citation verileri - Base64'ten decode et (UTF-8 ile)
+    const citationsBase64 = 'W10=';
+    const citationsJSON = new TextDecoder().decode(
+      Uint8Array.from(atob(citationsBase64), c => c.charCodeAt(0))
+    );
+    const CITATION_DATA = JSON.parse(citationsJSON);
+
+    function showCitations(nodeText) {
+      const cleanText = nodeText.trim();
+
+      // Citation'ı bul
+      const citationInfo = CITATION_DATA.find(c => c.madde === cleanText);
+
+      if (!citationInfo || !citationInfo.citations || citationInfo.citations.length === 0) {
+        return;
+      }
+
+      // Modal başlığı: "Madde metni [Kaynaklar: 2, 3]"
+      const citationBadge = '[Kaynaklar: ' + citationInfo.citation_ids.join(', ') + ']';
+      const titleWithBadge = cleanText + ' ' + citationBadge;
+
+      let html = '<div class="citation-body">';
+      html += '<p class="citation-lead"><strong>Madde:</strong> ' + escapeHTML(titleWithBadge) + '</p>';
+
+      citationInfo.citations.forEach((citation) => {
+        html += '<div class="citation-card">';
+        html += '<strong class="citation-card-title">📄 KAYNAK #' + citation.source_id + ':</strong><br>';
+        html += '<span class="citation-meta">• <strong>PDF:</strong> ' + escapeHTML(citation.pdf_name || 'Bilinmeyen') + '</span><br>';
+        html += '<span class="citation-meta">• <strong>Sayfa:</strong> ' + (citation.page_number || '?') + '</span><br>';
+        html += '<div class="citation-quote">';
+        html += '"' + escapeHTML(citation.content || '') + '"';
+        html += '</div>';
+        html += '</div>';
+      });
+      html += '</div>';
+
+      document.getElementById('citationContent').innerHTML = html;
+      document.getElementById('citationModal').classList.add('is-open');
+      document.getElementById('citationOverlay').classList.add('is-open');
+    }
+
+    function closeCitationModal() {
+      document.getElementById('citationModal').classList.remove('is-open');
+      document.getElementById('citationOverlay').classList.remove('is-open');
+    }
+
+    function escapeHTML(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    // D3.js node click event'ini TAMAMEN override et
+    setTimeout(() => {
+
+      document.querySelectorAll('.node').forEach(nodeGroup => {
+        const rect = nodeGroup.querySelector('rect');
+        if (!rect) return;
+
+        // ÇOK ÖNEMLİ: onclick property'sini OVERRIDE et (addEventListener DEĞİL!)
+        // Böylece D3.js sonradan handler eklese bile bizimki geçerli olur
+        rect.onclick = function(e) {
+          // title attribute'unu kullan (D3.js tam metni orada saklar)
+          const titleEl = nodeGroup.querySelector('title');
+          const textEl = nodeGroup.querySelector('text');
+
+          // Önce title'ı dene (tam metin), yoksa text içeriğini al
+          let nodeText = '';
+          if (titleEl) {
+            nodeText = titleEl.textContent;
+          } else if (textEl) {
+            // Tüm tspan'leri birleştir
+            const tspans = textEl.querySelectorAll('tspan');
+            if (tspans.length > 0) {
+              nodeText = Array.from(tspans).map(t => t.textContent).join(' ');
+            } else {
+              nodeText = textEl.textContent;
+            }
+          }
+
+          // Modal aç (showCitations içinde citation kontrolü yapılıyor)
+          if (nodeText) {
+            e.stopPropagation();
+            e.preventDefault();
+            showCitations(nodeText);
+            return false; // Event'i tamamen durdur
+          }
+        };
+      });
+
+    }, 1000); // Timeout'u biraz artırdık (500ms → 1000ms)
+  </script>
+</body>
+</html>

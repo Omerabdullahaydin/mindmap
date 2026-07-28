@@ -1,0 +1,9 @@
+{
+  "name": "mindmap",
+  "private": true,
+  "description": "Bu klasörün kökünde durup 'npm start' diyebilmeniz için buraya konmuş bir yönlendirici. Gerçek proje _run/ klasöründedir.",
+  "scripts": {
+    "start": "npm start --prefix _run",
+    "start:heuristic": "npm run start:heuristic --prefix _run"
+  }
+}

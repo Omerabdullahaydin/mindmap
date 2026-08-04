@@ -1,50 +1,110 @@
 //rag memory for mindmap
 //
-// ORİJİNAL sürüm Azure OpenAI Embeddings + Azure AI Search kullanıyordu.
-// Kullanıcının Azure erişimi olmadığı için burada iki değişiklik yapıldı:
-//   1) AzureOpenAIEmbeddings -> OllamaEmbeddings (yerel embedding modeli)
-//   2) AzureAISearchVectorStore -> MemoryVectorStore (LangChain'in RAM'de
-//      çalışan basit vektör deposu). Azure Search bir "bulut veritabanı"
-//      olduğu için process'ler arasında kalıcıydı; MemoryVectorStore ise
-//      sadece bu Node.js sürecinin hafızasında yaşar. Bu proje tek bir
-//      "workflow.invoke()" çağrısı içinde baştan sona çalıştığı için
-//      (docIngest -> map -> reduce -> tools sırayla, aynı süreçte) bu fark
-//      etmiyor: docIngestNodeMindmap vektör deposunu doldurur, birkaç adım
-//      sonra toolNode -> getCitationTool -> makeMindmapRetriever aynı
-//      depodan okur.
-import { OllamaEmbeddings } from "@langchain/ollama";
-import { MemoryVectorStore } from "langchain/vectorstores/memory";
+// ADVANCED RAG NOTU: Kullanıcının elindeki Azure kaynağında bir EMBEDDING
+// deployment'ı yok (sadece bir chat/Responses modeli var) — bu yüzden
+// "anlamsal" (semantic/vektör) benzerlik aramasını Azure ÜZERİNDEN
+// YAPAMIYORUZ. Bunun temeli, naif kelime sayımından çok daha güçlü bir
+// "lexical" (kelime tabanlı) sıralama algoritması olan BM25 (bkz. bm25.ts).
+// EK OLARAK, yerelde çalışan Ollama üzerinden (nomic-embed-text modeliyle,
+// bkz. Utils/ollamaEmbeddingClient.ts) gerçek embedding de hesaplanıyor ve
+// bellek-içi bir vektör indeksinde (bkz. vectorIndex.ts) tutuluyor — BM25'in
+// kaçırdığı eş anlamlı/parafraz eşleşmelerini yakalamak için. Ollama o an
+// çalışmıyorsa bu katman sessizce atlanır, pipeline sadece BM25 ile devam
+// eder (bkz. makeMindmapEmbeddingRetriever). Sorgu genişletme (query
+// expansion, bkz. queryExpansion.ts) ve LLM tabanlı reranking (bkz.
+// rag_tool_citation.ts) ile birlikte, bunlar klasik "Advanced RAG" hattının
+// (pre-retrieval -> retrieval -> post-retrieval) hibrit bir versiyonunu
+// oluşturuyor.
 import { PDFLoader } from "@langchain/community/document_loaders/fs/pdf";
-import { VectorStoreRetriever } from "@langchain/core/vectorstores";
 import type { Document } from "@langchain/core/documents";
 import { readdirSync } from "fs";
 import path from "path";
 import 'dotenv/config';
+import { BM25Index } from "./bm25.js";
+import { VectorIndex } from "./vectorIndex.js";
+import { OllamaEmbeddingClient } from "../Utils/ollamaEmbeddingClient.js";
 
-//embeddings instance (yerel Ollama embedding modeli)
-function getEmbeddingModel() {
-  return new OllamaEmbeddings({
-    model: process.env.OLLAMA_EMBED_MODEL || "nomic-embed-text"
-  });
+// tokenize: Bir metni küçük harfe çevirip sadece harf/rakam dizilerine
+// (kelimelere) ayırır. "\p{L}\p{N}" Unicode harf/rakam sınıfını kullanır,
+// böylece Türkçe karakterler (ç, ğ, ı, ö, ş, ü) doğru şekilde kelime
+// sınırlarına dahil olur. 2 karakterden kısa kelimeler (bağlaçlar vb. gibi
+// anlam taşımayan kısa kelimeler) elenir.
+export function tokenize(text: string): string[] {
+  return (text.toLowerCase().match(/[\p{L}\p{N}]+/gu) || []).filter(w => w.length > 2);
 }
 
-// Azure AI Search'ün yerini alan, bellekte tutulan basit vektör deposu.
-// docIngestNodeMindmap tarafından doldurulur, makeMindmapRetriever tarafından
+// BM25Retriever: docIngestNodeMindmap'in topladığı TÜM paragrafları BM25
+// indeksine yükler. invoke(query, k) çağrıldığında, sorguya göre en yüksek
+// BM25 skoruna sahip "k" paragrafı döndürür. rag_tool_citation.ts'nin
+// beklediği "retriever.invoke(query) -> Document[]" arayüzüyle (LangChain'in
+// VectorStoreRetriever'ıyla aynı şekilde) uyumludur; k'yi çağrı başına
+// (multi-query/fusion için farklı sorgularla) özelleştirebilmek için opsiyonel
+// ikinci parametre olarak alır.
+class BM25Retriever {
+  private index: BM25Index<Document>;
+
+  constructor(docs: Document[], private defaultK: number) {
+    this.index = new BM25Index(docs, d => d.pageContent, tokenize);
+  }
+
+  async invoke(query: string, k?: number): Promise<Document[]> {
+    return this.index.search(query, k ?? this.defaultK).map(r => r.item);
+  }
+}
+
+// EmbeddingRetriever: rag_tool_citation.ts'nin beklediği aynı
+// "invoke(query, k) -> Document[]" arayüzünü, BM25 yerine yerel Ollama
+// embedding'i + cosine similarity (bkz. vectorIndex.ts) ile sağlar. BM25'in
+// yakalayamadığı eş anlamlı/parafraz eşleşmelerini yakalamak için BM25'e EK
+// olarak (onun yerine değil) kullanılıyor — bkz. rag_tool_citation.ts'teki
+// RRF fusion.
+class EmbeddingRetriever {
+  private index: VectorIndex<Document>;
+  private embeddingClient: OllamaEmbeddingClient;
+
+  constructor(docs: Document[], vectors: number[][], private defaultK: number) {
+    this.index = new VectorIndex(docs, vectors);
+    this.embeddingClient = new OllamaEmbeddingClient();
+  }
+
+  async invoke(query: string, k?: number): Promise<Document[]> {
+    const queryVector = await this.embeddingClient.embedOne(query);
+    return this.index.search(queryVector, k ?? this.defaultK).map(r => r.item);
+  }
+}
+
+// Azure AI Search'ün yerini alan, bellekte tutulan basit paragraf listesi
+// (ve buna paralel embedding vektörleri). docIngestNodeMindmap tarafından
+// doldurulur, makeMindmapRetriever/makeMindmapEmbeddingRetriever tarafından
 // okunur. Modül seviyesinde (dosya genelinde) tutulduğu için, aynı Node.js
-// süreci içindeki her iki fonksiyon da aynı depoyu paylaşır.
-let localVectorStore: MemoryVectorStore | null = null;
+// süreci içindeki her iki fonksiyon da aynı listeyi paylaşır.
+let localDocuments: Document[] | null = null;
+let localEmbeddings: number[][] | null = null; // localDocuments ile aynı sırada, aynı uzunlukta
 
 //retriever oluştur - mindmap için daha fazla sonuç
-export function makeMindmapRetriever(): VectorStoreRetriever {
-  if (!localVectorStore) {
+export function makeMindmapRetriever(): BM25Retriever {
+  if (!localDocuments) {
     throw new Error(
-      "Vektör deposu henüz oluşturulmadı. makeMindmapRetriever() çağrılmadan önce " +
+      "Paragraf listesi henüz oluşturulmadı. makeMindmapRetriever() çağrılmadan önce " +
       "docIngestNodeMindmap() çalışıp PDF'leri işlemiş olmalı."
     );
   }
-  return localVectorStore.asRetriever({
-    k: 3 // Her sorguda en benzer 3 paragrafı getir
-  });
+  return new BM25Retriever(localDocuments, 8); // Advanced RAG: LLM'in reranking yapabilmesi için daha GENİŞ bir aday havuzu (3 değil, 8)
+}
+
+// embedding retriever oluştur - localEmbeddings hesaplanamadıysa (ör. Ollama
+// o an çalışmıyorsa) fırlatır; çağıran taraf (rag_tool_citation.ts) bunu
+// yakalayıp sadece BM25 ile devam edebilir (embedding, BM25'e EK bir katman,
+// zorunlu bağımlılık değil).
+export function makeMindmapEmbeddingRetriever(): EmbeddingRetriever {
+  if (!localDocuments || !localEmbeddings) {
+    throw new Error(
+      "Embedding listesi henüz oluşturulmadı (Ollama kullanılamamış olabilir). " +
+      "makeMindmapEmbeddingRetriever() çağrılmadan önce docIngestNodeMindmap() " +
+      "başarıyla çalışmış olmalı."
+    );
+  }
+  return new EmbeddingRetriever(localDocuments, localEmbeddings, 8);
 }
 
 
@@ -210,7 +270,7 @@ async function loadPDFs(filePaths: string[]): Promise<Document[]> {
 
 // Doküman ingest node - Mindmap için
 export async function docIngestNodeMindmap(state: any) {
-  console.log("PDF INGEST NODE (Mindmap - yerel Ollama embedding)");
+  console.log("PDF INGEST NODE (Mindmap - anahtar kelime araması)");
 
   // ESKİDEN tek bir sabit dosya adı vardı: "./documents/FransaSolidarizm.pdf".
   // Kullanıcı kendi PDF'ini yükleyebilsin diye, artık documents/ klasöründeki
@@ -240,15 +300,39 @@ export async function docIngestNodeMindmap(state: any) {
     return state;
   }
 
-  console.log(`${paragraphs.length} paragraf çıkarıldı, yerel embedding hesaplanıyor (Ollama)...`);
+  console.log(`${paragraphs.length} paragraf çıkarıldı, bellekteki listeye ekleniyor...`);
 
-  const embeddingModel = getEmbeddingModel();
+  // Paragrafları modül seviyesindeki listeye yükle (bkz. makeMindmapRetriever).
+  localDocuments = paragraphs;
 
-  // Tüm paragrafları embed edip bellekteki vektör deposuna yükle.
-  // (Azure AI Search'e "upload" etmenin yerini bu alıyor.)
-  localVectorStore = await MemoryVectorStore.fromDocuments(paragraphs, embeddingModel);
+  console.log(`✓ ${paragraphs.length} paragraf belleğe eklendi.`);
 
-  console.log(`✓ ${paragraphs.length} paragraf yerel vektör deposuna eklendi.`);
+  // ---- Embedding hesapla (yerel Ollama üzerinden) ----
+  // Bu adım OPSİYONEL: Ollama o an çalışmıyorsa ya da model kurulu değilse,
+  // sadece uyarı verip localEmbeddings'i null bırakıyoruz — pipeline BM25 ile
+  // (embedding'siz) çalışmaya devam eder, çökmez (bkz.
+  // makeMindmapEmbeddingRetriever ve rag_tool_citation.ts'teki try/catch).
+  try {
+    console.log("Embedding'ler hesaplanıyor (yerel Ollama, nomic-embed-text)...");
+    const embeddingClient = new OllamaEmbeddingClient();
+    const EMBED_BATCH_SIZE = 64; // Tek istekte gönderilecek paragraf sayısı
+    const embeddings: number[][] = [];
+
+    for (let i = 0; i < paragraphs.length; i += EMBED_BATCH_SIZE) {
+      const batch = paragraphs.slice(i, i + EMBED_BATCH_SIZE);
+      const batchVectors = await embeddingClient.embed(batch.map(d => d.pageContent));
+      embeddings.push(...batchVectors);
+    }
+
+    localEmbeddings = embeddings;
+    console.log(`✓ ${embeddings.length} embedding hesaplandı.`);
+  } catch (error: any) {
+    console.warn(
+      "⚠️ Embedding hesaplanamadı (Ollama çalışmıyor olabilir), sadece BM25 ile devam edilecek:",
+      error.message
+    );
+    localEmbeddings = null;
+  }
 
   return {
     ...state,

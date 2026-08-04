@@ -19,27 +19,17 @@
 //   5) expandItems  -> Her kategori için ayrıca uzun bir "eğitim anlatım
 //                      metni" (podcast/seslendirme senaryosu gibi) üret
 //
-// Not: Buradaki TÜM LLM çağrıları artık yerel Ollama üzerinden yapılıyor
-// (getOllamaChatModel), Azure OpenAI'ye hiç ihtiyaç yok.
+// Not: Buradaki TÜM LLM çağrıları Azure OpenAI üzerinden yapılıyor
+// (getAzureChatModel, bkz. Utils/helper.ts).
 // ============================================================================
 
 import "dotenv/config"; // .env dosyasındaki ortam değişkenlerini (varsa) otomatik yükle
 import { StateGraph, START, END, Annotation } from "@langchain/langgraph"; // Adım adım iş akışı (graph) kurmamızı sağlayan kütüphane
-// AzureChatOpenAI yerine yerel Ollama modeli kullanılıyor (bkz. Utils/helper.ts)
-import { getOllamaChatModel } from "./Utils/helper.js";
+import { getAzureChatModel } from "./Utils/helper.js";
 import type { Document } from "@langchain/core/documents";
 import { docIngestNodeMindmap } from "./Rag/rag_memory2.js";
 import { getCitationTool } from "./Tools/rag_tool_citation.js";
 import { getMindmapVisualizationTool } from "../mcp/mindmap_visualization_server.js";
-import { MindmapMCPClient } from "../mcp/client.js";
-import { spawn } from "child_process";
-import path from "path";
-import { fileURLToPath } from "url";
-
-// ESM modüllerinde "__dirname" hazır gelmez (CommonJS'ten farklı olarak),
-// bu iki satır onu elle yeniden oluşturur (dosyanın kendi konumunu bulmak için).
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 // ----------------------------------------------------------------------------
 // STATE ANNOTATION: Bu "iş akışının hafızası" gibi düşünülebilir. Her adım
@@ -84,11 +74,6 @@ export const MindmapStateAnnotation = Annotation.Root({
     default: () => ""
   }),
 
-  session_id: Annotation<string>({      // Bu çalıştırmaya özel benzersiz bir kimlik (MCP bağlantısı için kullanılır)
-    reducer: (x, y) => y ?? x,
-    default: () => `session_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`
-  }),
-
   expanded_items: Annotation<Array<{    // expandItems adımından çıkan, her kategori için üretilen anlatım metinleri
     categoryId: number,
     categoryTitle: string,
@@ -112,7 +97,7 @@ export async function mapNode(state: typeof MindmapStateAnnotation.State) {
   const topic = state.topic;
   const documents = state.documents ?? [];
 
-  const llm = getOllamaChatModel(); // Yerel Ollama chat modeli (bkz. Utils/helper.ts)
+  const llm = getAzureChatModel(); // Azure OpenAI chat modeli (bkz. Utils/helper.ts)
 
   // Hiç doküman (PDF paragrafı) yoksa özetlenecek bir şey yok, boş dön.
   if (documents.length === 0) {
@@ -232,7 +217,7 @@ ${chunkContent}
 COMPREHENSIVE SUMMARY (in Turkish, paragraph form):`;
 
     // ÖNEMLİ (sağlamlık): Bu try/catch SADECE bu parçayı etkiler. Bir parçanın
-    // özetlenmesi başarısız olsa bile (ör. Ollama geçici bir hata verse),
+    // özetlenmesi başarısız olsa bile (ör. Azure OpenAI geçici bir hata verse),
     // diğer parçalar etkilenmez ve "Promise.all" tümden çökmez — sadece o
     // parça için "Özetlenemedi" yazan bir yer tutucu metin döner.
     try {
@@ -270,7 +255,7 @@ export async function reduceNode(state: typeof MindmapStateAnnotation.State) {
     };
   }
 
-  const llm = getOllamaChatModel();
+  const llm = getAzureChatModel();
 
   const documentsSummary = summaries.join('\n\n---\n\n');
 
@@ -338,13 +323,11 @@ Create a DETAILED, SEQUENTIAL, and NUMBERED mindmap in Turkish about "${topic}".
 // ============================================================================
 // ADIM 4: TOOL NODE — Kaynak (citation) ekleme + HTML görselleştirme
 // ----------------------------------------------------------------------------
-// GİRDİ: mindmap_without_citations, session_id
+// GİRDİ: mindmap_without_citations
 // ÇIKTI: mindmap_with_citations, citations, html_file_path
 // ============================================================================
 export async function toolNode(state: typeof MindmapStateAnnotation.State) {
   const mindmap = state.mindmap_without_citations;
-  const sessionId = state.session_id;
-  const useMCP = process.env.USE_MCP === 'true'; // MCP sunucusu üzerinden mi, yoksa fonksiyonu doğrudan mı çağıralım?
 
   // Bir önceki adım (reduceNode) hata döndürdüyse, burada da devam etmenin
   // anlamı yok - hatayı olduğu gibi yukarı taşıyıp erken çık.
@@ -386,61 +369,16 @@ export async function toolNode(state: typeof MindmapStateAnnotation.State) {
     console.log(`✓ Citations added: ${finalCitations.length} citations`);
 
     // ---- ADIM 2: HTML görselleştirmesini oluştur ----
-    // İki yol var: MCP (Model Context Protocol) sunucusu üzerinden UZAKTAN
-    // çağırmak, ya da fonksiyonu bu process içinde DOĞRUDAN çağırmak.
-    // Hangisinin kullanılacağı USE_MCP ortam değişkenine bağlı.
-    let htmlPath = "";
-
-    if (useMCP) {
-      // MCP kullan: ayrı bir sunucu sürecine bağlanıp oradan istek yapıyoruz.
-      console.log("🎨 Creating HTML via MCP...");
-
-      const mcpClient = new MindmapMCPClient(sessionId);
-
-      try {
-        await mcpClient.connect();
-
-        const visualizationResult = await mcpClient.visualizeMindmap(
-          finalMindmap,
-          finalCitations
-        );
-
-        if (visualizationResult.success) {
-          htmlPath = visualizationResult.html_path || "";
-          console.log(`✓ HTML created via MCP: ${htmlPath}`);
-        } else {
-          console.error(`✗ MCP visualization failed: ${visualizationResult.error}`);
-        }
-
-        await mcpClient.close();
-      } catch (mcpError: any) {
-        // MCP sunucusuna bağlanılamazsa (ör. sunucu çalışmıyorsa), PANİK
-        // YAPMA — doğrudan yönteme (aynı fonksiyonu bu process içinde
-        // çağırmaya) geri dön. Kullanıcı yine de bir HTML alır.
-        console.error(`✗ MCP error: ${mcpError.message}`);
-        console.log("⚠️ Falling back to direct method...");
-
-        const visualizationToolConfig = getMindmapVisualizationTool();
-        const visualizationResult = await visualizationToolConfig.func({
-          markdown_content: finalMindmap,
-          citations: finalCitations
-        });
-        const visualizationParsed = JSON.parse(visualizationResult);
-        htmlPath = visualizationParsed.html_path || "";
-      }
-    } else {
-      // Doğrudan yöntem (varsayılan, daha basit): aynı process içinde,
-      // ağ üzerinden hiçbir şeye bağlanmadan HTML'i üret.
-      console.log("🎨 Creating HTML directly...");
-      const visualizationToolConfig = getMindmapVisualizationTool();
-      const visualizationResult = await visualizationToolConfig.func({
-        markdown_content: finalMindmap,
-        citations: finalCitations
-      });
-      const visualizationParsed = JSON.parse(visualizationResult);
-      htmlPath = visualizationParsed.html_path || "";
-      console.log(`✓ HTML created directly: ${htmlPath}`);
-    }
+    // Aynı process içinde, ağ üzerinden hiçbir şeye bağlanmadan HTML'i üret.
+    console.log("🎨 Creating HTML directly...");
+    const visualizationToolConfig = getMindmapVisualizationTool();
+    const visualizationResult = await visualizationToolConfig.func({
+      markdown_content: finalMindmap,
+      citations: finalCitations
+    });
+    const visualizationParsed = JSON.parse(visualizationResult);
+    const htmlPath = visualizationParsed.html_path || "";
+    console.log(`✓ HTML created directly: ${htmlPath}`);
 
     return {
       mindmap_with_citations: finalMindmap,
@@ -585,9 +523,9 @@ export async function expandItemsNode(state: typeof MindmapStateAnnotation.State
   const categoriesToExpand = categories;
   console.log(`🎯 Expanding all ${categoriesToExpand.length} categories`);
 
-  // Paralel eğitim içeriği oluştur (yerel Ollama modeli).
-  // Bu adım uzun anlatım metinleri ürettiği için numPredict'i daha yüksek tutuyoruz.
-  const llm = getOllamaChatModel({ numPredict: 3000 });
+  // Paralel eğitim içeriği oluştur (Azure OpenAI modeli).
+  // Bu adım uzun anlatım metinleri ürettiği için maxTokens'ı daha yüksek tutuyoruz.
+  const llm = getAzureChatModel({ maxTokens: 3000 });
 
   // Her kategori için AYRI bir "anlatım senaryosu" isteği hazırla, hepsi paralel çalışır.
   const expandPromises = categoriesToExpand.map(async (category, index) => {
@@ -691,7 +629,7 @@ The script must have a clear, logical flow based on the total time:
 
     // ÖNEMLİ (sağlamlık, yeni eklendi): ESKİDEN burada try/catch YOKTU.
     // Yani 9-15 kategoriden BİR TANESİNİN LLM isteği başarısız olsa (ör.
-    // Ollama'nın o an meşgul olması, ağ/zaman aşımı vb.), "Promise.all"
+    // Azure OpenAI'ın o an rate-limit/zaman aşımı vermesi vb.), "Promise.all"
     // TÜMÜYLE reddedilir (reject) ve TÜM kategorilerin sonucu kaybolurdu.
     // Şimdi her kategori kendi hatasını yakalıyor; biri başarısız olsa bile
     // diğer kategorilerin anlatım metinleri kaybolmuyor, sadece o kategori
@@ -770,41 +708,6 @@ const workflow = new StateGraph(MindmapStateAnnotation)
 export const mindmapCitationAgentV2 = workflow.compile();
 
 mindmapCitationAgentV2.name = "Mindmap Citation Agent V2 (Tool-Based)";
-
-// ----------------------------------------------------------------------------
-// MCP sunucusunu otomatik başlat (SADECE USE_MCP=true ise).
-// MCP (Model Context Protocol), bu araçları AYRI bir sunucu süreci olarak
-// çalıştırıp, ona ağ üzerinden (SSE) bağlanmayı sağlayan bir protokoldür.
-// Varsayılan olarak KAPALIDIR (useMCP false ise toolNode zaten doğrudan
-// yöntemi kullanıyor); bu blok sadece USE_MCP=true yapılırsa devreye girer.
-// ----------------------------------------------------------------------------
-if (process.env.USE_MCP === 'true') {
-  const mcpServerPath = path.join(__dirname, '..', 'mcp', 'server.ts');
-  const mcpProcess = spawn('npx', ['tsx', mcpServerPath], {
-    stdio: 'inherit',   // Alt sürecin çıktısını doğrudan bu terminale yansıt
-    shell: true,
-    detached: false     // Ana process kapanınca bu alt süreç de kapansın
-  });
-
-  mcpProcess.on('error', (error) => {
-    console.error('❌ Failed to start MCP server:', error.message);
-  });
-
-  // Program Ctrl+C (SIGINT) ya da normal sonlandırma (SIGTERM) sinyali
-  // alırsa, arkada kalan MCP sürecini de düzgünce kapat (öksüz process
-  // kalmasın diye).
-  process.on('SIGINT', () => {
-    mcpProcess.kill();
-    process.exit();
-  });
-
-  process.on('SIGTERM', () => {
-    mcpProcess.kill();
-    process.exit();
-  });
-
-  console.log('🚀 MCP Server auto-started in background');
-}
 
 // "description" CompiledStateGraph tipinin resmi bir alanı olmadığı için
 // tsc bunu hata sayıyor; "as any" ile bu tip kontrolünü bilerek atlıyoruz

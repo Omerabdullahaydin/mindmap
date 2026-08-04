@@ -1,20 +1,20 @@
-import { ChatOllama } from "@langchain/ollama";
+import { AzureResponsesChatModel } from "./azureResponsesClient.js";
 
 /**
- * Yerel Ollama chat modeli döndürür (Azure OpenAI'nin yerini alıyor).
- * Kullanıcının Azure erişimi olmadığı için, projedeki TÜM LLM çağrıları
- * (mapNode, reduceNode, expandItemsNode, citation seçimi) bu tek fonksiyonu
- * kullanır. Model adı OLLAMA_CHAT_MODEL ortam değişkeniyle değiştirilebilir.
+ * Azure OpenAI (Responses API) chat modeli döndürür. Projedeki TÜM LLM
+ * çağrıları (mapNode, reduceNode, expandItemsNode, citation seçimi) bu tek
+ * fonksiyonu kullanır.
  *
- * numPredict yüksek tutuluyor (2048) çünkü düşük bırakılırsa (Ollama'nın
- * varsayılanı çok düşük, ör. 128) uzun cevaplar (mindmap, özet, senaryo)
- * yarıda kesilebiliyor - bu, "gemma4" thinking modeliyle ilk denememizde
- * gerçekten yaşadığımız bir sorundu.
+ * Kimlik bilgileri kod içinde YOK — azureResponsesClient.ts bunları çalışma
+ * anında şu ortam değişkenlerinden okur (bkz. _run/.env.example):
+ *   AZURE_OPENAI_RESPONSES_URL, AZURE_OPENAI_API_KEY, AZURE_OPENAI_MODEL
+ *
+ * maxTokens yüksek tutuluyor (2048) çünkü düşük bırakılırsa uzun cevaplar
+ * (mindmap, özet, senaryo) yarıda kesilebiliyor.
  */
-export function getOllamaChatModel(options: { temperature?: number; numPredict?: number } = {}): ChatOllama {
-  return new ChatOllama({
-    model: process.env.OLLAMA_CHAT_MODEL || "qwen2.5:7b",
+export function getAzureChatModel(options: { temperature?: number; maxTokens?: number } = {}): AzureResponsesChatModel {
+  return new AzureResponsesChatModel({
     temperature: options.temperature ?? 0.3,
-    numPredict: options.numPredict ?? 2048
+    maxTokens: options.maxTokens ?? 2048
   });
 }

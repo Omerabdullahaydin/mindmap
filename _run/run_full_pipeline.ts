@@ -6,9 +6,9 @@
 // expandItems) uçtan uca çalıştıran KÜÇÜK bir başlatma (driver) script'idir.
 // "npm start" komutu bu dosyayı çalıştırır.
 //
-// Artık Azure yerine tamamen yerel Ollama modelleri kullanıyor — bu dosyanın
-// kendisi hiçbir LLM çağrısı yapmıyor, sadece pipeline'ı başlatıp sonucu
-// okunaklı bir şekilde terminale yazdırıyor.
+// Pipeline Azure OpenAI kullanıyor (bkz. .env.example) — bu dosyanın kendisi
+// hiçbir LLM çağrısı yapmıyor, sadece pipeline'ı başlatıp sonucu okunaklı
+// bir şekilde terminale yazdırıyor.
 // ============================================================================
 import { mindmapCitationAgentV2 } from "./Agents/mindmap_citation_v2.js";
 

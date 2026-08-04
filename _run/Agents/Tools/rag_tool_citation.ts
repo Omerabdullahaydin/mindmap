@@ -6,31 +6,58 @@
 // tanımlanmış, MCP DEĞİL — mindmap_visualization_server.ts'teki MCP tool'undan
 // farklı, o ayrı bir şey).
 //
-// GENEL AKIŞ:
-//   1. Her madde için, yerel vektör deposunda (bkz. rag_memory2.ts) BENZERLİK
-//      ARAMASI yap -> o maddeye anlamca en yakın 3 PDF paragrafını bul
-//   2. Bu 3 adayı bir LLM'e gösterip "bunlardan hangisi/hangileri GERÇEKTEN
-//      bu maddeyle ilgili?" diye sor (LLM burada bir "seçici/hakem" gibi
-//      davranıyor — sadece benzerlik skoruna değil, anlam uygunluğuna bakıyor)
-//   3. Seçilen kaynakları mindmap markdown'ına "[Kaynaklar: 0, 2]" gibi
+// ADVANCED RAG HATTI (HİBRİT: BM25 + yerel Ollama embedding):
+//   1. PRE-RETRIEVAL — Sorgu genişletme: Her madde için LLM'den ek arama
+//      terimleri (eş anlamlı/ilgili kavramlar) iste (bkz. queryExpansion.ts)
+//   2. RETRIEVAL — Multi-query + Hibrit Fusion: Her madde için HEM orijinal
+//      metinle HEM genişletilmiş sorguyla, HEM BM25 (kelime tabanlı, bkz.
+//      rag_memory2.ts) HEM embedding (anlam tabanlı, yerel Ollama üzerinden —
+//      Azure kaynağında embedding deployment'ı olmadığı için) araması yap;
+//      sonuçları RRF (Reciprocal Rank Fusion, bkz. fusion.ts) ile birleştir ->
+//      geniş bir aday havuzu (en fazla 8 paragraf) elde et. Ollama
+//      çalışmıyorsa embedding katmanı sessizce atlanır, sadece BM25 kullanılır.
+//   3. POST-RETRIEVAL — LLM reranking: Bu geniş aday havuzunu bir LLM'e
+//      gösterip "bunlardan hangisi/hangileri GERÇEKTEN bu maddeyle ilgili?"
+//      diye sor (LLM burada bir "seçici/hakem" gibi davranıyor — sadece BM25
+//      skoruna değil, anlam uygunluğuna bakıyor)
+//   4. Seçilen kaynakları mindmap markdown'ına "[Kaynaklar: 0, 2]" gibi
 //      rozetler olarak ekle
 // ============================================================================
 import { z } from "zod"; // Veri şekillerini (schema) tanımlamamızı ve doğrulamamızı sağlayan kütüphane
-import { makeMindmapRetriever } from "../Rag/rag_memory2.js";
-// AzureChatOpenAI yerine yerel Ollama modeli kullanılıyor (bkz. Utils/helper.ts)
-import { getOllamaChatModel } from "../Utils/helper.js";
+import type { Document } from "@langchain/core/documents";
+import { makeMindmapRetriever, makeMindmapEmbeddingRetriever } from "../Rag/rag_memory2.js";
+import { expandQueriesBatch } from "../Rag/queryExpansion.js";
+import { reciprocalRankFusion } from "../Rag/fusion.js";
+import { getAzureChatModel } from "../Utils/helper.js";
+
+const CANDIDATE_POOL_SIZE = 8; // Reranker'a sunulacak, fusion sonrası en fazla aday sayısı
+const PER_QUERY_K = 5;         // Her TEK sorgu (orijinal ya da genişletilmiş) için BM25'ten kaç sonuç istensin
 
 /**
- * Citation Tool: Finds relevant sources for mindmap items using vector similarity search
+ * Citation Tool: Finds relevant sources for mindmap items using an
+ * embedding-free Advanced RAG pipeline (query expansion + multi-query BM25
+ * fusion + LLM reranking).
  */
 export function getCitationTool() {
-  // retriever: "bir metin ver, bana anlamca en yakın kayıtları getir" diyebildiğimiz obje.
-  // rag_memory2.ts'teki yerel vektör deposundan (MemoryVectorStore) besleniyor.
+  // retriever: "bir metin ver, bana en alakalı (BM25) kayıtları getir" diyebildiğimiz obje.
+  // rag_memory2.ts'teki BM25 indeksinden besleniyor.
   const retriever = makeMindmapRetriever();
+
+  // embeddingRetriever: BM25'in kaçırdığı eş anlamlı/parafraz eşleşmelerini
+  // yakalamak için EK bir arama katmanı (yerel Ollama embedding'i, bkz.
+  // rag_memory2.ts). Ollama o an çalışmıyorsa ya da ingest sırasında
+  // embedding hesaplanamadıysa, burada null kalır ve aşağıda sadece BM25
+  // sonuçlarıyla devam edilir — embedding zorunlu bir bağımlılık değil.
+  let embeddingRetriever: ReturnType<typeof makeMindmapEmbeddingRetriever> | null = null;
+  try {
+    embeddingRetriever = makeMindmapEmbeddingRetriever();
+  } catch (error: any) {
+    console.warn("⚠️ Embedding retriever kullanılamıyor, sadece BM25 ile devam edilecek:", error.message);
+  }
 
   return {
     name: "add_citations_to_mindmap",
-    description: "Finds and adds citations (source references) to mindmap items using vector similarity search. For each mindmap item, searches the local vector store and returns the top-3 most relevant PDF pages with page numbers.",
+    description: "Finds and adds citations (source references) to mindmap items using an embedding-free Advanced RAG pipeline (query expansion + multi-query BM25 fusion + LLM reranking). For each mindmap item, returns the most relevant PDF pages with page numbers.",
     // schema: bu tool'un HANGİ PARAMETRELERİ beklediğini tanımlar (zod ile).
     // Bir LLM bu tool'u "çağırmak" istediğinde, bu şekle uyması gerekir.
     schema: z.object({
@@ -40,17 +67,54 @@ export function getCitationTool() {
     // func: tool GERÇEKTEN çağrıldığında çalışacak asıl fonksiyon.
     func: async ({ mindmap_markdown, items }: { mindmap_markdown: string; items: string[] }) => {
       try {
-        // ---- ADIM 1: Her madde için PARALEL benzerlik araması yap ----
-        // "items.map(item => retriever.invoke(item))" -> her madde için AYNI ANDA
-        // bir arama başlatır (hepsi birbirini beklemeden), Promise.all ile
-        // hepsinin bitmesini bekleriz. Bu, 30 maddeyi TEK TEK, sırayla
-        // aramaktan çok daha hızlıdır.
-        const searchPromises = items.map(item => retriever.invoke(item));
+        // ---- ADIM 1 (pre-retrieval): Tüm maddeler için sorgu genişletme ----
+        console.log("🔎 Sorgular genişletiliyor (query expansion)...");
+        const expansions = await expandQueriesBatch(items);
+
+        // ---- ADIM 2 (retrieval + fusion): Her madde için multi-query, HİBRİT (BM25 + embedding) arama ----
+        // Her madde için BM25 (kelime tabanlı, kesin eşleşme) VE, varsa,
+        // embedding (anlam tabanlı, parafraz/eş anlamlı eşleşme) aramaları
+        // AYRI AYRI yapılır — her ikisi de HEM orijinal metinle HEM
+        // genişletilmiş sorguyla (madde + LLM'in ürettiği ek terimler)
+        // çalıştırılır. Sonuçta 2-4 ayrı sıralı liste elde edilir; bunlar RRF
+        // (Reciprocal Rank Fusion, bkz. fusion.ts) ile TEK bir sıralı aday
+        // havuzunda birleştirilir — ham skorları değil, her listedeki SIRAyı
+        // esas alır (BM25 skoru ile cosine similarity karşılaştırılabilir
+        // birimlerde değil).
+        const searchPromises = items.map(async item => {
+          const expansionWords = expansions.get(item) || [];
+          const expandedQuery = expansionWords.length > 0 ? `${item} ${expansionWords.join(' ')}` : null;
+
+          const [bm25Original, bm25Expanded] = await Promise.all([
+            retriever.invoke(item, PER_QUERY_K),
+            expandedQuery ? retriever.invoke(expandedQuery, PER_QUERY_K) : Promise.resolve([] as Document[])
+          ]);
+
+          const resultLists: Document[][] = [bm25Original, bm25Expanded];
+
+          if (embeddingRetriever) {
+            try {
+              const [embedOriginal, embedExpanded] = await Promise.all([
+                embeddingRetriever.invoke(item, PER_QUERY_K),
+                expandedQuery ? embeddingRetriever.invoke(expandedQuery, PER_QUERY_K) : Promise.resolve([] as Document[])
+              ]);
+              resultLists.push(embedOriginal, embedExpanded);
+            } catch (error: any) {
+              // Bu maddeye özel embedding araması başarısız olursa (ör. Ollama
+              // o an geçici bir hata verdiyse), sadece BM25 sonuçlarıyla devam
+              // et — tüm işlemi durdurma.
+              console.warn(`⚠️ Embedding araması başarısız oldu ("${item.slice(0, 40)}..."):`, error.message);
+            }
+          }
+
+          const fused = reciprocalRankFusion(resultLists);
+          return fused.slice(0, CANDIDATE_POOL_SIZE);
+        });
         const searchResults = await Promise.all(searchPromises);
 
         // ---- Sonuçları LLM'e sunmak için düzenle ----
-        // Her madde için, bulunan en iyi 3 paragrafı (page) bir arada tutan
-        // bir yapı oluşturuyoruz.
+        // Her madde için, fusion sonrası bulunan adayları (page) bir arada
+        // tutan bir yapı oluşturuyoruz.
         interface MaddeWithPages {
           madde: string;
           pages: { pageIdx: number; page: number; content: string; source: string }[];
@@ -59,7 +123,7 @@ export function getCitationTool() {
         const maddelerWithPages: MaddeWithPages[] = [];
 
         searchResults.forEach((docs, idx) => {
-          const pages = docs.slice(0, 3).map((doc, pageIdx) => {
+          const pages = docs.map((doc, pageIdx) => {
             let pageNum = 0;
             let sourcePath = "bilinmeyen";
 
@@ -96,20 +160,37 @@ export function getCitationTool() {
           }
         });
 
-        // ---- ADIM 2: LLM'e "en alakalı kaynağı seç" diye sor ----
-        const llm = getOllamaChatModel();
+        // ---- ADIM 3 (post-retrieval): LLM'e "en alakalı kaynağı seç" diye sor ----
+        // (reranking — geniş fusion havuzundan gerçekten alakalı olanları eler)
+        const llm = getAzureChatModel();
 
         // BatchCitationSchema: LLM'den beklediğimiz cevabın TAM ŞEKLİ.
-        // "withStructuredOutput" bu şemayı kullanarak LLM'i, düz metin yerine
-        // bu şekle uyan bir JSON üretmeye zorlar (mümkün olduğunca).
+        // Kullandığımız Azure Responses istemcisinde LangChain'in
+        // "withStructuredOutput" (şema zorlayan) özelliği YOK — bunun yerine
+        // modele "SADECE bu şekle uyan JSON döndür" diye talimat veriyoruz
+        // (bkz. batchPrompt) ve cevabı aşağıda zod ile DOĞRULUYORUZ. Zod
+        // doğrulaması başarısız olursa (model şemayı bozarsa), bu zaten var
+        // olan retry/fallback mekanizmasını tetikler (aşağıda).
         const BatchCitationSchema = z.object({
           citations: z.array(z.object({
             item_index: z.number().describe("Item index (0-based)"),
-            source_indices: z.array(z.number()).describe("Selected source indices (0, 1, 2)")
+            source_indices: z.array(z.number()).describe(`Selected source indices (0 to ${CANDIDATE_POOL_SIZE - 1})`)
           }))
         });
 
-        const structuredLLM = llm.withStructuredOutput(BatchCitationSchema);
+        // parseCitationResponse: LLM'in düz metin cevabından JSON'ı çıkarır
+        // (bazen ```json ... ``` gibi kod bloğuna sarılı gelebilir) ve
+        // BatchCitationSchema'ya göre doğrular. Uymazsa fırlatır (throw) —
+        // bu, çağıran taraftaki retry/fallback döngüsünü tetikler.
+        const parseCitationResponse = (raw: string): z.infer<typeof BatchCitationSchema> => {
+          const start = raw.indexOf('{');
+          const end = raw.lastIndexOf('}');
+          if (start === -1 || end === -1 || end < start) {
+            throw new Error("Cevapta JSON bulunamadı");
+          }
+          const jsonText = raw.slice(start, end + 1);
+          return BatchCitationSchema.parse(JSON.parse(jsonText));
+        };
 
         // ------------------------------------------------------------------
         // KÜÇÜK GRUPLAR (BATCH) HALİNDE İŞLE — sağlamlık için eklendi
@@ -153,17 +234,18 @@ export function getCitationTool() {
             });
           });
 
-          const batchPrompt = `You are a citation assistant. Select the MOST RELEVANT source(s) for each item.
+          const batchPrompt = `You are a citation assistant. Each item below has a pool of CANDIDATE sources (found via keyword search, not all are necessarily relevant). Select ONLY the source(s) that are ACTUALLY relevant to each item.
 
 FOR EACH ITEM:
-- Source indices are 0, 1, 2 (the item's own sources)
-- Select at least 1 source
-- If no sources are available, return an empty array
+- Source indices refer to the item's own numbered candidate list (starts at 0)
+- Select 1-3 truly relevant sources; ignore candidates that are off-topic even if they share some keywords
+- If no candidates are actually relevant, return an empty array
 
-ITEMS AND THEIR SOURCES:
+ITEMS AND THEIR CANDIDATE SOURCES:
 ${batchContext}
 
-Return citations for each item as JSON matching the required schema:`;
+Respond with ONLY a single JSON object, no other text, no markdown code fences, matching EXACTLY this shape:
+{"citations":[{"item_index":0,"source_indices":[0,1]}]}`;
 
           // applyCitations: LLM'den gelen (şemaya uygun) sonucu allCitations'a ekleyen küçük yardımcı fonksiyon.
           const applyCitations = (batchResult: { citations: { item_index: number; source_indices: number[] }[] }) => {
@@ -212,7 +294,8 @@ Return citations for each item as JSON matching the required schema:`;
           let succeeded = false;
           for (let attempt = 0; attempt <= RETRY_COUNT && !succeeded; attempt++) {
             try {
-              const batchResult = await structuredLLM.invoke(batchPrompt);
+              const rawResult = await llm.invoke(batchPrompt);
+              const batchResult = parseCitationResponse(rawResult.content);
               applyCitations(batchResult);
               succeeded = true;
             } catch (batchError: any) {

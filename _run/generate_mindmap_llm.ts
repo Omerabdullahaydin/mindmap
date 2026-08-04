@@ -2,24 +2,21 @@
 // BU DOSYA NE İŞE YARAR? (Baştan sona, adım adım)
 // ----------------------------------------------------------------------------
 // Bu, PDF'ten GERÇEK bir yapay zeka (LLM) kullanarak mindmap üreten script'tir.
-// Azure OpenAI yerine, bilgisayarınızda YEREL olarak çalışan "Ollama" adlı
-// programı ve onun üzerinde çalışan iki modeli kullanır:
+// Azure OpenAI'nin bir "chat" (Responses API) modelini kullanır — PDF metnini
+// özetlemek ve mindmap'in kategori/madde yapısını yazmak için.
 //
-//   1) Bir "chat" (sohbet/metin üretme) modeli -> PDF metnini özetlemek ve
-//      mindmap'in kategori/madde yapısını yazmak için (varsayılan: qwen2.5:7b)
-//   2) Bir "embedding" (metni sayılara çevirme) modeli -> her mindmap
-//      maddesinin, PDF'in HANGİ paragrafından geldiğini bulmak için
-//      (varsayılan: nomic-embed-text)
-//
-// "Embedding" ne demek, kısaca: Bir cümleyi sayılardan oluşan bir listeye
-// (vektöre) çeviririz. Anlamca birbirine yakın iki cümlenin vektörleri de
-// birbirine yakın çıkar. Böylece "bu mindmap maddesine en çok hangi PDF
-// paragrafı benziyor?" sorusunu, kelimeleri birebir aratmadan, ANLAM bazında
-// cevaplayabiliriz. Bu işleme İngilizce'de "semantic search" (anlamsal arama)
-// denir. Azure AI Search'ün (ve orijinal projedeki rag_memory2.ts'in) yaptığı
-// iş de tam olarak buydu; biz burada aynısını, bulutta değil, yerel bilgisayarda
-// (Ollama ile) ve LangChain'in basit "MemoryVectorStore" (bellekte vektör
-// deposu) aracıyla yapıyoruz.
+// KAYNAK EŞLEŞTİRME NASIL YAPILIYOR? (Advanced RAG, embedding OLMADAN)
+// Kullanıcının Azure kaynağında bir EMBEDDING (anlamsal arama) modeli YOK,
+// sadece bir chat modeli var. Bu yüzden her mindmap maddesini PDF
+// paragraflarıyla eşleştirirken üç adımlı, embedding gerektirmeyen bir
+// "Advanced RAG" hattı kullanıyoruz (bkz. Agents/Rag/bm25.ts ve
+// Agents/Rag/queryExpansion.ts, bu script onları doğrudan paylaşıyor):
+//   1) Pre-retrieval: her madde için LLM'den ek arama terimleri (eş anlamlı/
+//      ilgili kavramlar) iste (query expansion)
+//   2) Retrieval + fusion: hem orijinal madde metniyle hem genişletilmiş
+//      sorguyla ayrı ayrı BM25 araması yap, sonuçları birleştir
+//   3) Post-retrieval: LLM'e bu aday havuzunu gösterip GERÇEKTEN alakalı
+//      olanları seçtir (reranking) — bkz. Adım 4'ün içindeki matchCitations
 //
 // GENEL AKIŞ:
 //   1. PDF'i oku, sayfa sayfa metne çevir, paragrafları yeniden birleştir
@@ -28,37 +25,32 @@
 //      parça parça özetlemek, "map-reduce" denen klasik bir tekniktir)
 //   3. REDUCE AŞAMASI: Tüm özetleri birleştirip LLM'e tekrar gönder, bu sefer
 //      "bana numaralı, kategorili bir mindmap markdown'ı yaz" diye iste
-//   4. KAYNAK EŞLEŞTİRME: Mindmap'teki her maddeyi, embedding modeliyle
-//      PDF'in orijinal paragraflarıyla karşılaştırıp en çok benzeyenleri bul
-//      (bu, tıklanınca "kaynak gösteren" citation özelliğini besler)
+//   4. KAYNAK EŞLEŞTİRME: Yukarıdaki Advanced RAG hattıyla her maddeyi PDF
+//      paragraflarıyla eşleştir (tıklanınca "kaynak gösteren" citation
+//      özelliğini besler)
 //   5. Sonucu, mindmap_visualization_server.ts'teki GERÇEK HTML üretme
 //      fonksiyonuna verip görsel mindmap dosyasını oluştur
 // ============================================================================
 
 import { PDFLoader } from "@langchain/community/document_loaders/fs/pdf"; // PDF'i sayfa sayfa metne çevirir
-import { ChatOllama, OllamaEmbeddings } from "@langchain/ollama";          // Yerel Ollama modellerine bağlanmak için LangChain araçları
-import { MemoryVectorStore } from "langchain/vectorstores/memory";        // Basit, bellekte (RAM'de) çalışan bir "vektör veritabanı"
-import { Document } from "@langchain/core/documents";                    // LangChain'in standart "metin parçası" objesi
+import { AzureResponsesChatModel } from "./Agents/Utils/azureResponsesClient.js"; // Azure OpenAI (Responses API) chat modeline bağlanmak için minimal istemci
+import { BM25Index } from "./Agents/Rag/bm25.js";
+import { expandQueriesBatch } from "./Agents/Rag/queryExpansion.js";
 import { createLiveMindmapHTML } from "./mcp/mindmap_visualization_server.js"; // Gerçek HTML mindmap üretici
 import path from "path";
 import { readdirSync } from "fs";
+import "dotenv/config";
+
+// tokenize: bkz. Agents/Rag/rag_memory2.ts'teki aynı fonksiyonun ayrıntılı açıklaması.
+function tokenize(text: string): string[] {
+  return (text.toLowerCase().match(/[\p{L}\p{N}]+/gu) || []).filter(w => w.length > 2);
+}
 
 // ---- Ayarlar (istenirse ortam değişkeniyle değiştirilebilir) ----
 const PDF_DIR = "./documents";
 
-// qwen2.5:7b: doğrudan cevap veren (thinking/reasoning ön hazırlığı YAPMAYAN)
-// bir "instruct" (talimat izleyen) model. Neden bunu seçtik?
-// İlk denemede en büyük/en yeni yerel model olan "gemma4"ü kullandık, ama o
-// bir "thinking" modeliydi: cevap vermeden önce sayfalarca kendi kendine
-// "düşünme" metni yazıyor. Bu düşünme metni token (kelime parçası) sınırına
-// takılıp asıl mindmap'e HİÇ ULAŞAMADAN kesildi. qwen2.5:7b böyle bir "iç
-// monolog" yapmadan doğrudan cevap verdiği için bu iş için daha güvenilir.
-const CHAT_MODEL = process.env.OLLAMA_CHAT_MODEL || "qwen2.5:7b";
-const EMBED_MODEL = process.env.OLLAMA_EMBED_MODEL || "nomic-embed-text";
-
 const PAGES_PER_CHUNK = 8;       // Map aşamasında kaç sayfa bir arada özetlensin
 const TOTAL_MINUTES = 12;        // Mindmap'teki (MM:SS) süre etiketlerinin toplamı (sadece görsel/kozmetik)
-const CITATIONS_PER_ITEM = 2;    // Her madde için en fazla kaç kaynak (benzer paragraf) bulunsun
 
 // ----------------------------------------------------------------------------
 // pageNumberOf: PDFLoader'ın sayfa numarasını sakladığı alan sürüme göre
@@ -166,13 +158,14 @@ async function main() {
   console.log(`${allParagraphs.length} paragraf çıkarıldı.`);
 
   // ---- LLM bağlantısını kur ----
-  // ChatOllama: yerel Ollama sunucusuna (varsayılan olarak http://127.0.0.1:11434
-  // adresinde çalışır) bağlanıp seçtiğimiz modelle konuşmamızı sağlayan LangChain sınıfı.
+  // AzureResponsesChatModel: kimlik bilgilerini (AZURE_OPENAI_RESPONSES_URL,
+  // AZURE_OPENAI_API_KEY, AZURE_OPENAI_MODEL) çalışma anında ortam
+  // değişkenlerinden okur (bkz. .env.example).
   //   - temperature: 0.3 -> düşük değer = daha "tutarlı/az yaratıcı" cevaplar
   //     (mindmap gibi yapılandırılmış bir çıktı için yüksek yaratıcılık istemeyiz)
-  //   - numPredict: 2048 -> modelin üretebileceği maksimum kelime parçası (token)
+  //   - maxTokens: 2048 -> modelin üretebileceği maksimum kelime parçası (token)
   //     sayısı. Bunu yeterince yüksek tutmazsak, uzun bir mindmap yarıda kesilebilir.
-  const llm = new ChatOllama({ model: CHAT_MODEL, temperature: 0.3, numPredict: 2048 });
+  const llm = new AzureResponsesChatModel({ temperature: 0.3, maxTokens: 2048 });
 
   // ---- 2) MAP AŞAMASI: PDF'i parça parça özetle ----
   // Neden tüm PDF'i tek seferde LLM'e vermiyoruz? Çünkü modellerin bir
@@ -188,7 +181,7 @@ async function main() {
     });
   }
 
-  console.log(`Map aşaması: ${chunks.length} parça özetlenecek (model: ${CHAT_MODEL})...`);
+  console.log(`Map aşaması: ${chunks.length} parça özetlenecek (Azure OpenAI)...`);
   const summaries: string[] = [];
   for (let i = 0; i < chunks.length; i++) {
     const c = chunks[i];
@@ -238,20 +231,9 @@ Yukarıdaki kurallara uyarak "${topic}" için DETAYLI, SIRALI ve NUMARALANDIRILM
   const mindmapRaw = extractMarkdown(typeof reduceRes.content === 'string' ? reduceRes.content : JSON.stringify(reduceRes.content));
   console.log("✓ Mindmap taslağı oluşturuldu.");
 
-  // ---- 4) KAYNAK EŞLEŞTİRME: Her maddeyi en benzer PDF paragrafıyla eşleştir ----
-  console.log(`Kaynaklar embedleniyor (model: ${EMBED_MODEL})...`);
-
-  // OllamaEmbeddings: metni sayı listesine (vektöre) çeviren model bağlantısı.
-  const embeddings = new OllamaEmbeddings({ model: EMBED_MODEL });
-
-  // PDF'ten çıkardığımız tüm paragrafları LangChain'in "Document" formatına çevir
-  // (pageContent = metin, metadata = ek bilgi; burada hangi sayfadan geldiğini tutuyoruz).
-  const docs = allParagraphs.map(p => new Document({ pageContent: p.text, metadata: { page: p.page } }));
-
-  // MemoryVectorStore.fromDocuments: TÜM paragrafları embedding modeline gönderip
-  // vektörlerini hesaplar ve bunları bellekte (RAM'de) bir "arama dizini" olarak saklar.
-  // Bu, Azure AI Search'ün yaptığı işin basit/yerel bir karşılığıdır.
-  const vectorStore = await MemoryVectorStore.fromDocuments(docs, embeddings);
+  // ---- 4) KAYNAK EŞLEŞTİRME: Advanced RAG (query expansion + BM25 fusion + LLM reranking) ----
+  console.log("Kaynaklar için BM25 indeksi oluşturuluyor...");
+  const bm25 = new BM25Index(allParagraphs, p => p.text, tokenize);
 
   // Mindmap markdown'ındaki "- " ile başlayan satırları (yani maddeleri) bul.
   const lines = mindmapRaw.split('\n');
@@ -261,32 +243,127 @@ Yukarıdaki kurallara uyarak "${topic}" için DETAYLI, SIRALI ve NUMARALANDIRILM
     if (t.startsWith('-')) items.push(t.substring(1).trim()); // Baştaki "-" işaretini at, metni sakla
   });
 
-  console.log(`${items.length} madde için kaynak aranıyor...`);
+  // ---- Pre-retrieval: sorgu genişletme (bkz. dosyanın başındaki açıklama) ----
+  console.log(`${items.length} madde için sorgular genişletiliyor (query expansion)...`);
+  const expansions = await expandQueriesBatch(items);
+
+  // ---- Retrieval + fusion: her madde için multi-query BM25 araması ----
+  console.log(`${items.length} madde için kaynak aranıyor (BM25 + fusion)...`);
+  const PER_QUERY_K = 5;
+  const CANDIDATE_POOL_SIZE = 8;
+
+  const candidatesByItem = new Map<string, { text: string; page: number }[]>();
+  for (const item of items) {
+    const expansionWords = expansions.get(item) || [];
+    const expandedQuery = expansionWords.length > 0 ? `${item} ${expansionWords.join(' ')}` : null;
+
+    const originalResults = bm25.search(item, PER_QUERY_K).map(r => r.item);
+    const expandedResults = expandedQuery ? bm25.search(expandedQuery, PER_QUERY_K).map(r => r.item) : [];
+
+    // Fusion: iki sonucu birleştir, aynı paragrafı (metnine göre) tekrar etme.
+    const seen = new Set<string>();
+    const fused: { text: string; page: number }[] = [];
+    for (const doc of [...originalResults, ...expandedResults]) {
+      if (!seen.has(doc.text)) {
+        seen.add(doc.text);
+        fused.push(doc);
+      }
+    }
+    candidatesByItem.set(item, fused.slice(0, CANDIDATE_POOL_SIZE));
+  }
+
+  // ---- Post-retrieval: LLM reranking — aday havuzundan gerçekten alakalı olanları seç ----
+  console.log("LLM ile kaynaklar yeniden sıralanıyor (reranking)...");
   const citations: any[] = [];
   // Aynı madde metni birden fazla yerde geçse bile doğru eşleşsin diye,
   // her maddenin metnini anahtar (key) yapıp bulunan kaynak ID'lerini saklıyoruz.
   const citationIdsByItem = new Map<string, number[]>();
   let citationId = 0; // Her kaynağa benzersiz bir numara veriyoruz (0, 1, 2, ...)
 
-  for (const item of items) {
-    // similaritySearch: "Bu maddeye ANLAMCA en çok hangi paragraflar benziyor?"
-    // sorusunu sorar ve en yakın CITATIONS_PER_ITEM (2) tanesini döndürür.
-    const results = await vectorStore.similaritySearch(item, CITATIONS_PER_ITEM);
-    const ids: number[] = [];
-    for (const r of results) {
-      const id = citationId++;
-      citations.push({
-        source_id: id,
-        pdf_name: pdfName,
-        page_number: r.metadata.page, // Bu paragrafın PDF'in kaçıncı sayfasından geldiği
-        content: r.pageContent,       // Paragrafın gerçek metni (tıklayınca gösterilecek)
-        // "madde" alanı, bu kaynağın mindmap'teki HANGİ maddeye ait olduğunu
-        // birebir metin eşleşmesiyle belirtir (tıklama modalının çalışması için ZORUNLU).
-        madde: item
+  const RERANK_BATCH_SIZE = 5;
+  const RERANK_RETRY_COUNT = 1;
+
+  const extractJsonBlock = (raw: string): string => {
+    const start = raw.indexOf('{');
+    const end = raw.lastIndexOf('}');
+    if (start === -1 || end === -1 || end < start) throw new Error("Cevapta JSON bulunamadı");
+    return raw.slice(start, end + 1);
+  };
+
+  for (let i = 0; i < items.length; i += RERANK_BATCH_SIZE) {
+    const batchItems = items.slice(i, i + RERANK_BATCH_SIZE);
+    const batchNumber = i / RERANK_BATCH_SIZE + 1;
+
+    let batchContext = "";
+    batchItems.forEach((item, localIdx) => {
+      const candidates = candidatesByItem.get(item) || [];
+      batchContext += `\n=== ITEM ${localIdx}: "${item}" ===\nSources:\n`;
+      candidates.forEach((c, cIdx) => {
+        const content = c.text.length > 500 ? c.text.slice(0, 500) + "..." : c.text;
+        batchContext += `[${cIdx}] Page ${c.page}: ${content}\n`;
       });
-      ids.push(id);
+    });
+
+    const batchPrompt = `You are a citation assistant. Each item has a pool of CANDIDATE sources (found via keyword search, not all necessarily relevant). Select ONLY the truly relevant source(s) for each item.
+
+FOR EACH ITEM:
+- Source indices refer to the item's own numbered candidate list (starts at 0)
+- Select 1-2 truly relevant sources; ignore off-topic candidates even if they share some keywords
+- If none of the candidates are actually relevant, return an empty array
+
+ITEMS AND THEIR CANDIDATE SOURCES:
+${batchContext}
+
+Respond with ONLY a single JSON object, no other text, no markdown code fences, matching EXACTLY this shape:
+{"citations":[{"item_index":0,"source_indices":[0,1]}]}`;
+
+    const applyCitations = (parsed: { citations: { item_index: number; source_indices: number[] }[] }) => {
+      parsed.citations.forEach(c => {
+        const item = batchItems[c.item_index];
+        if (!item) return;
+        const candidates = candidatesByItem.get(item) || [];
+        const ids = citationIdsByItem.get(item) || [];
+        c.source_indices.forEach(srcIdx => {
+          const cand = candidates[srcIdx];
+          if (!cand) return;
+          const id = citationId++;
+          citations.push({ source_id: id, pdf_name: pdfName, page_number: cand.page, content: cand.text, madde: item });
+          ids.push(id);
+        });
+        citationIdsByItem.set(item, ids);
+      });
+    };
+
+    // applyFallback: LLM hiçbir şekilde başarılı olamazsa, en azından her
+    // maddeye BM25 aramasının EN İYİ eşleşmesini otomatik ata.
+    const applyFallback = () => {
+      batchItems.forEach(item => {
+        const candidates = candidatesByItem.get(item) || [];
+        if (candidates.length > 0) {
+          const cand = candidates[0];
+          const id = citationId++;
+          citations.push({ source_id: id, pdf_name: pdfName, page_number: cand.page, content: cand.text, madde: item });
+          citationIdsByItem.set(item, [...(citationIdsByItem.get(item) || []), id]);
+        }
+      });
+    };
+
+    let succeeded = false;
+    for (let attempt = 0; attempt <= RERANK_RETRY_COUNT && !succeeded; attempt++) {
+      try {
+        const res = await llm.invoke(batchPrompt);
+        const parsed = JSON.parse(extractJsonBlock(res.content));
+        applyCitations(parsed);
+        succeeded = true;
+      } catch (error: any) {
+        if (attempt < RERANK_RETRY_COUNT) {
+          console.warn(`⚠️ Batch ${batchNumber} kaynak seçimi başarısız (deneme ${attempt + 1}), tekrar deneniyor...`);
+        } else {
+          console.warn(`⚠️ Batch ${batchNumber} kaynak seçimi başarısız oldu (${error.message}), en alakalı kaynak otomatik ekleniyor.`);
+          applyFallback();
+        }
+      }
     }
-    citationIdsByItem.set(item, ids);
   }
 
   // Şimdi markdown'ı satır satır gezip, her maddenin sonuna bulduğumuz
@@ -308,7 +385,7 @@ Yukarıdaki kurallara uyarak "${topic}" için DETAYLI, SIRALI ve NUMARALANDIRILM
   console.log("Oluşturuldu:", outPath);
 }
 
-// Script'i çalıştır. Bir hata olursa (örn. Ollama sunucusu kapalıysa, ya da
-// PDF bozuksa) programın sessizce takılıp kalması yerine hatayı ekrana yazıp
+// Script'i çalıştır. Bir hata olursa (örn. Azure OpenAI kimlik bilgileri
+// eksikse, ya da PDF bozuksa) programın sessizce takılıp kalması yerine hatayı ekrana yazıp
 // çıkış kodu 1 (= "başarısız") ile sonlanmasını sağla.
 main().catch(e => { console.error("HATA:", e); process.exit(1); });

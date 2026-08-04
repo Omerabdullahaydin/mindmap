@@ -323,7 +323,7 @@ Create a DETAILED, SEQUENTIAL, and NUMBERED mindmap in Turkish about "${topic}".
 // ============================================================================
 // ADIM 4: TOOL NODE — Kaynak (citation) ekleme + HTML görselleştirme
 // ----------------------------------------------------------------------------
-// GİRDİ: mindmap_without_citations
+// GİRDİ: mindmap_without_citations, session_id
 // ÇIKTI: mindmap_with_citations, citations, html_file_path
 // ============================================================================
 export async function toolNode(state: typeof MindmapStateAnnotation.State) {

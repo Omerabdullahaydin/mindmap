@@ -270,7 +270,7 @@ async function loadPDFs(filePaths: string[]): Promise<Document[]> {
 
 // Doküman ingest node - Mindmap için
 export async function docIngestNodeMindmap(state: any) {
-  console.log("PDF INGEST NODE (Mindmap - anahtar kelime araması)");
+  console.log("PDF INGEST NODE (Mindmap - BM25 + yerel embedding hibrit arama)");
 
   // ESKİDEN tek bir sabit dosya adı vardı: "./documents/FransaSolidarizm.pdf".
   // Kullanıcı kendi PDF'ini yükleyebilsin diye, artık documents/ klasöründeki

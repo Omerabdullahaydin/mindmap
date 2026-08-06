@@ -210,7 +210,7 @@ function renderTree(md,opts){
   const treeData=cachedTreeData;
 
   const tree=d3.tree()
-    .nodeSize([60,220])
+    .nodeSize([90,220])
     .separation((a,b)=>a.parent===b.parent?1:1.5);
 
   // Daraltılmış (_collapsed) düğümlerin çocukları hiyerarşiye hiç girmez,

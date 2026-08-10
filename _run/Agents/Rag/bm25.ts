@@ -17,7 +17,7 @@
 
 interface IndexedDoc<T> {
   item: T;
-  tokens: string[];
+  docLength: number; // tokens.length — doküman uzunluğu normalizasyonu için lazım, token dizisinin kendisi hiç okunmuyor
   termFreq: Map<string, number>;
 }
 
@@ -46,7 +46,7 @@ export class BM25Index<T> {
       const termFreq = new Map<string, number>();
       for (const t of tokens) termFreq.set(t, (termFreq.get(t) || 0) + 1);
 
-      this.docs.push({ item, tokens, termFreq });
+      this.docs.push({ item, docLength: tokens.length, termFreq });
       totalLength += tokens.length;
 
       for (const t of termFreq.keys()) {
@@ -66,7 +66,7 @@ export class BM25Index<T> {
 
     const scored = this.docs.map(doc => {
       let score = 0;
-      const docLen = doc.tokens.length;
+      const docLen = doc.docLength;
 
       for (const qt of queryTokens) {
         const tf = doc.termFreq.get(qt) || 0;

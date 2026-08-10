@@ -2,6 +2,7 @@
 import { promises as fs } from "fs";
 import path from "path";
 import { escapeHtml } from "../utils/html_utils.js";
+import { groupCitationsByMadde } from "../Agents/Utils/citations.js";
 
 // D3.js HTML Template
 const HTML_TEMPLATE_LIVE = `<!doctype html>
@@ -210,7 +211,7 @@ function renderTree(md,opts){
   const treeData=cachedTreeData;
 
   const tree=d3.tree()
-    .nodeSize([90,220])
+    .nodeSize([90,280])
     .separation((a,b)=>a.parent===b.parent?1:1.5);
 
   // Daraltılmış (_collapsed) düğümlerin çocukları hiyerarşiye hiç girmez,
@@ -603,86 +604,77 @@ if(document.fonts && document.fonts.ready){
 </html>`;
 
 /**
- * Creates interactive HTML mindmap from markdown content with citations
+ * MindmapVisualizer: kaynaklı mindmap markdown'ını interaktif bir D3.js HTML
+ * dosyasına çeviren sınıf. HTML_TEMPLATE_LIVE (yukarıdaki dev client-side
+ * D3.js şablonu) değişmeden kalıyor — bu class sadece onu okuyup markdown/
+ * citation verisini içine yerleştiren, dosyaya yazan sunucu tarafı mantığı
+ * kapsüllüyor.
  */
-export async function createLiveMindmapHTML(
-  markdownContent: string,
-  citations: any[] = [],
-  filename: string = "mindmap_live.html"
-): Promise<string> {
-  const outdir = "mindmaps";
+export class MindmapVisualizer {
+  constructor(private outDir: string = "mindmaps") {}
 
-  // Create output directory
-  await fs.mkdir(outdir, { recursive: true });
+  // render: kaynaklı markdown'ı ve citation listesini alıp interaktif HTML
+  // dosyasını diske yazar, dosyanın MUTLAK yolunu döndürür.
+  async render(
+    markdownContent: string,
+    citations: any[] = [],
+    filename: string = "mindmap_live.html"
+  ): Promise<string> {
+    // Create output directory
+    await fs.mkdir(this.outDir, { recursive: true });
 
-  const filePath = path.join(outdir, filename);
+    const filePath = path.join(this.outDir, filename);
 
-  // D3.js için markdown'ı temizle - citation badge'lerini kaldır
-  const cleanMarkdown = markdownContent.replace(/\[Kaynaklar:.*?\]/g, '').trim();
+    // D3.js için markdown'ı temizle - citation badge'lerini kaldır
+    const cleanMarkdown = markdownContent.replace(/\[Kaynaklar:.*?\]/g, '').trim();
 
-  // Escape markdown for HTML safety
-  const safeMarkdown = escapeHtml(cleanMarkdown);
+    // Escape markdown for HTML safety
+    const safeMarkdown = escapeHtml(cleanMarkdown);
 
-  // Replace placeholder with clean markdown content
-  let htmlContent = HTML_TEMPLATE_LIVE.replace("/*INITIAL_MARKDOWN*/", safeMarkdown);
+    // Replace placeholder with clean markdown content
+    let htmlContent = HTML_TEMPLATE_LIVE.replace("/*INITIAL_MARKDOWN*/", safeMarkdown);
 
-  // Add citations if available
-  if (citations.length > 0) {
-    htmlContent = injectCitationsToD3HTML(htmlContent, citations);
+    // Add citations if available
+    if (citations.length > 0) {
+      htmlContent = this.injectCitations(htmlContent, citations);
+    }
+
+    // Write HTML file
+    await fs.writeFile(filePath, htmlContent, "utf-8");
+
+    return path.resolve(filePath);
   }
 
-  // Write HTML file
-  await fs.writeFile(filePath, htmlContent, "utf-8");
+  // injectCitations: D3.js HTML'ine citation verilerini inject eder. Private
+  // — render()'ın bir iç adımı, dosya dışından hiç kullanılmıyor.
+  private injectCitations(htmlContent: string, citations: any[] = []): string {
+    // Citation'ları madde bazında grupla (bkz. Agents/Utils/citations.ts).
+    // stripBadge: madde metninden "[Kaynaklar: ...]" rozetini temizle.
+    // warnOnMissing: bir citation'da "madde" alanı hiç yoksa (ESKİDEN bu
+    // durumda "Cannot read properties of undefined (reading 'replace')"
+    // hatasıyla tüm mindmap üretimi çöküyordu) sessizce atla, sadece uyar.
+    const citationsByMadde = groupCitationsByMadde(citations, { stripBadge: true, warnOnMissing: true });
 
-  return path.resolve(filePath);
-}
+    // Citation verilerini JSON olarak hazırla
+    const citationsJSON = JSON.stringify(Array.from(citationsByMadde.entries()).map(([madde, cits]) => ({
+      madde,
+      citation_ids: cits.map(c => c.source_id),
+      citations: cits.map(c => ({
+        source_id: c.source_id,
+        pdf_name: c.pdf_name,
+        page_number: c.page_number,
+        content: c.content || ''
+      }))
+    })));
 
-/**
- * D3.js HTML'ine citation verilerini inject eder
- */
-function injectCitationsToD3HTML(htmlContent: string, citations: any[] = []): string {
-  // Citation'ları madde bazında grupla - madde metninden citation badge'ini temizle
-  const citationsByMadde = new Map<string, any[]>();
-  citations.forEach(citation => {
-    // ---- BUG FIX ----
-    // ESKİDEN burada doğrudan "citation.madde.replace(...)" çağrılıyordu.
-    // Eğer bir citation objesinde "madde" alanı hiç yoksa (undefined), bu
-    // satır "Cannot read properties of undefined (reading 'replace')"
-    // hatasıyla ÇÖKÜYORDU ve tüm mindmap üretimi başarısız oluyordu.
-    // Şimdi önce "madde var mı?" diye kontrol ediyoruz; yoksa o citation'ı
-    // sessizce ATLIYORUZ (sadece bir uyarı basıyoruz), tüm işlemi çökertmiyoruz.
-    if (!citation?.madde) {
-      console.warn("Citation 'madde' alanı eksik, atlanıyor:", citation);
-      return; // forEach içindeki bu döngü adımını atla, bir sonraki citation'a geç
-    }
-    // Citation badge'ini kaldır: "Metin [Kaynaklar: 2]" -> "Metin"
-    const madde = citation.madde.replace(/\[Kaynaklar:.*?\]/g, '').trim();
-    if (!citationsByMadde.has(madde)) {
-      citationsByMadde.set(madde, []);
-    }
-    citationsByMadde.get(madde)!.push(citation);
-  });
+    // Base64 encode - SON ÇÖZÜM! Hiçbir syntax sorunu olmaz
+    const citationsBase64 = Buffer.from(citationsJSON, 'utf-8').toString('base64');
 
-  // Citation verilerini JSON olarak hazırla
-  const citationsJSON = JSON.stringify(Array.from(citationsByMadde.entries()).map(([madde, cits]) => ({
-    madde,
-    citation_ids: cits.map(c => c.source_id),
-    citations: cits.map(c => ({
-      source_id: c.source_id,
-      pdf_name: c.pdf_name,
-      page_number: c.page_number,
-      content: c.content || ''
-    }))
-  })));
-
-  // Base64 encode - SON ÇÖZÜM! Hiçbir syntax sorunu olmaz
-  const citationsBase64 = Buffer.from(citationsJSON, 'utf-8').toString('base64');
-
-  // Citation modal HTML
-  // NOT: Tüm görünüm (renk, boşluk, gölge) artık burada satır içi style="..."
-  // olarak DEĞİL, mcp/styles/mindmap.css içindeki .citation-* sınıflarında tanımlı —
-  // dağınık/tekrarlı satır içi CSS'i tek bir yerde toplamak için.
-  const citationHTML = `
+    // Citation modal HTML
+    // NOT: Tüm görünüm (renk, boşluk, gölge) artık burada satır içi style="..."
+    // olarak DEĞİL, mcp/styles/mindmap.css içindeki .citation-* sınıflarında tanımlı —
+    // dağınık/tekrarlı satır içi CSS'i tek bir yerde toplamak için.
+    const citationHTML = `
   <!-- Citation Modal -->
   <div id="citationModal" class="citation-modal">
     <div class="citation-modal-header">
@@ -788,56 +780,20 @@ function injectCitationsToD3HTML(htmlContent: string, citations: any[] = []): st
   </script>
 `;
 
-  // </body> tag'inden önce citation HTML'ini ekle
-  return htmlContent.replace('</body>', citationHTML + '</body>');
+    // </body> tag'inden önce citation HTML'ini ekle
+    return htmlContent.replace('</body>', citationHTML + '</body>');
+  }
 }
 
-/**
- * MCP Tool definition for LLM
- */
-export function getMindmapVisualizationTool() {
-  return {
-    name: "visualize_mindmap",
-    description: "Converts markdown mindmap to interactive D3.js HTML visualization with zoom, pan, live editing, and clickable citations",
-    schema: {
-      type: "object",
-      properties: {
-        markdown_content: {
-          type: "string",
-          description: "The markdown mindmap content to visualize (e.g., '# Title\\n## Category\\n- Item [Kaynaklar: 0, 1]')"
-        },
-        citations: {
-          type: "array",
-          // ---- BUG FIX ----
-          // ESKİDEN bu açıklamada "madde" alanından HİÇ bahsedilmiyordu, ama
-          // koddaki injectCitationsToD3HTML fonksiyonu bu alanı ZORUNLU
-          // sayıyordu. Yani bu tool'u çağıran biri (ör. bir LLM), SADECE bu
-          // açıklamayı okuyup ona uygun veri gönderse bile hatayla
-          // karşılaşıyordu. Şimdi "madde" alanı da açıkça belgeleniyor.
-          description: "Optional array of citation objects with source_id, pdf_name, page_number, content, madde (the exact mindmap item text this citation belongs to, without the [Kaynaklar: ...] badge)",
-          items: {
-            type: "object"
-          }
-        }
-      },
-      required: ["markdown_content"]
-    },
-    func: async ({ markdown_content, citations = [] }: { markdown_content: string; citations?: any[] }) => {
-      try {
-        const htmlPath = await createLiveMindmapHTML(markdown_content, citations);
-        return JSON.stringify({
-          success: true,
-          html_path: htmlPath,
-          message: `Mindmap HTML created at: ${htmlPath}`,
-          citations_count: citations?.length || 0
-        });
-      } catch (error: any) {
-        console.error("Mindmap visualization error:", error.message);
-        return JSON.stringify({
-          success: false,
-          error: error.message
-        });
-      }
-    }
-  };
+// createLiveMindmapHTML: GERİYE DÖNÜK UYUMLULUK SHIM'İ. generate.ts ve
+// generate_mindmap_llm.ts bu fonksiyonu doğrudan import edip çağırıyor —
+// bu iki dosya OOP dönüşümünün kapsamı dışında bırakıldı (tek seferlik
+// script'ler, çağrılar arası kalıcı bir state taşımıyorlar). Bu ince
+// sarmalayıcı sayesinde ikisi de hiç değişmeden çalışmaya devam ediyor.
+export async function createLiveMindmapHTML(
+  markdownContent: string,
+  citations: any[] = [],
+  filename: string = "mindmap_live.html"
+): Promise<string> {
+  return new MindmapVisualizer().render(markdownContent, citations, filename);
 }

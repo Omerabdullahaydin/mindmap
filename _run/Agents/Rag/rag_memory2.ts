@@ -10,14 +10,13 @@
 // bellek-içi bir vektör indeksinde (bkz. vectorIndex.ts) tutuluyor — BM25'in
 // kaçırdığı eş anlamlı/parafraz eşleşmelerini yakalamak için. Ollama o an
 // çalışmıyorsa bu katman sessizce atlanır, pipeline sadece BM25 ile devam
-// eder (bkz. makeMindmapEmbeddingRetriever). Sorgu genişletme (query
-// expansion, bkz. queryExpansion.ts) ve LLM tabanlı reranking (bkz.
-// rag_tool_citation.ts) ile birlikte, bunlar klasik "Advanced RAG" hattının
-// (pre-retrieval -> retrieval -> post-retrieval) hibrit bir versiyonunu
-// oluşturuyor.
+// eder (bkz. getEmbeddingRetriever). Sorgu genişletme (query expansion,
+// bkz. queryExpansion.ts) ve LLM tabanlı reranking (bkz. rag_tool_citation.ts)
+// ile birlikte, bunlar klasik "Advanced RAG" hattının (pre-retrieval ->
+// retrieval -> post-retrieval) hibrit bir versiyonunu oluşturuyor.
 import { PDFLoader } from "@langchain/community/document_loaders/fs/pdf";
 import type { Document } from "@langchain/core/documents";
-import { readdirSync } from "fs";
+import { readdir } from "fs/promises";
 import path from "path";
 import 'dotenv/config';
 import { BM25Index } from "./bm25.js";
@@ -28,27 +27,36 @@ import { OllamaEmbeddingClient } from "../Utils/ollamaEmbeddingClient.js";
 // (kelimelere) ayırır. "\p{L}\p{N}" Unicode harf/rakam sınıfını kullanır,
 // böylece Türkçe karakterler (ç, ğ, ı, ö, ş, ü) doğru şekilde kelime
 // sınırlarına dahil olur. 2 karakterden kısa kelimeler (bağlaçlar vb. gibi
-// anlam taşımayan kısa kelimeler) elenir.
+// anlam taşımayan kısa kelimeler) elenir. Saf/stateless bir fonksiyon
+// olduğu için class'a zorlanmadan burada fonksiyon olarak kalıyor.
 export function tokenize(text: string): string[] {
   return (text.toLowerCase().match(/[\p{L}\p{N}]+/gu) || []).filter(w => w.length > 2);
 }
 
-// BM25Retriever: docIngestNodeMindmap'in topladığı TÜM paragrafları BM25
+// extractPageNumber: Bir paragraf metninin başındaki "[Sayfa N]" etiketinden
+// (bkz. reconstructParagraphs) sayfa numarasını çıkarır. Bu proje genelinde
+// (rag_tool_citation.ts, mindmap_citation_v2.ts) aynı regex birden fazla
+// yerde tekrarlanıyordu — etiket formatının "sahibi" bu dosya olduğu için
+// tek, paylaşılan bir yer burada.
+export function extractPageNumber(pageContent: string): number {
+  const match = pageContent.match(/\[Sayfa (\d+)\]/);
+  return match ? parseInt(match[1]) || 0 : 0;
+}
+
+// BM25Retriever: MindmapRagStore'un topladığı TÜM paragrafları BM25
 // indeksine yükler. invoke(query, k) çağrıldığında, sorguya göre en yüksek
 // BM25 skoruna sahip "k" paragrafı döndürür. rag_tool_citation.ts'nin
-// beklediği "retriever.invoke(query) -> Document[]" arayüzüyle (LangChain'in
-// VectorStoreRetriever'ıyla aynı şekilde) uyumludur; k'yi çağrı başına
-// (multi-query/fusion için farklı sorgularla) özelleştirebilmek için opsiyonel
-// ikinci parametre olarak alır.
+// beklediği "retriever.invoke(query, k) -> Document[]" arayüzüyle
+// (LangChain'in VectorStoreRetriever'ıyla aynı şekilde) uyumludur.
 class BM25Retriever {
   private index: BM25Index<Document>;
 
-  constructor(docs: Document[], private defaultK: number) {
+  constructor(docs: Document[]) {
     this.index = new BM25Index(docs, d => d.pageContent, tokenize);
   }
 
-  async invoke(query: string, k?: number): Promise<Document[]> {
-    return this.index.search(query, k ?? this.defaultK).map(r => r.item);
+  async invoke(query: string, k: number): Promise<Document[]> {
+    return this.index.search(query, k).map(r => r.item);
   }
 }
 
@@ -60,56 +68,19 @@ class BM25Retriever {
 // RRF fusion.
 class EmbeddingRetriever {
   private index: VectorIndex<Document>;
-  private embeddingClient: OllamaEmbeddingClient;
 
-  constructor(docs: Document[], vectors: number[][], private defaultK: number) {
+  constructor(docs: Document[], vectors: number[][], private embeddingClient: OllamaEmbeddingClient) {
     this.index = new VectorIndex(docs, vectors);
-    this.embeddingClient = new OllamaEmbeddingClient();
   }
 
-  async invoke(query: string, k?: number): Promise<Document[]> {
+  async invoke(query: string, k: number): Promise<Document[]> {
     const queryVector = await this.embeddingClient.embedOne(query);
-    return this.index.search(queryVector, k ?? this.defaultK).map(r => r.item);
+    return this.index.search(queryVector, k).map(r => r.item);
   }
 }
-
-// Azure AI Search'ün yerini alan, bellekte tutulan basit paragraf listesi
-// (ve buna paralel embedding vektörleri). docIngestNodeMindmap tarafından
-// doldurulur, makeMindmapRetriever/makeMindmapEmbeddingRetriever tarafından
-// okunur. Modül seviyesinde (dosya genelinde) tutulduğu için, aynı Node.js
-// süreci içindeki her iki fonksiyon da aynı listeyi paylaşır.
-let localDocuments: Document[] | null = null;
-let localEmbeddings: number[][] | null = null; // localDocuments ile aynı sırada, aynı uzunlukta
-
-//retriever oluştur - mindmap için daha fazla sonuç
-export function makeMindmapRetriever(): BM25Retriever {
-  if (!localDocuments) {
-    throw new Error(
-      "Paragraf listesi henüz oluşturulmadı. makeMindmapRetriever() çağrılmadan önce " +
-      "docIngestNodeMindmap() çalışıp PDF'leri işlemiş olmalı."
-    );
-  }
-  return new BM25Retriever(localDocuments, 8); // Advanced RAG: LLM'in reranking yapabilmesi için daha GENİŞ bir aday havuzu (3 değil, 8)
-}
-
-// embedding retriever oluştur - localEmbeddings hesaplanamadıysa (ör. Ollama
-// o an çalışmıyorsa) fırlatır; çağıran taraf (rag_tool_citation.ts) bunu
-// yakalayıp sadece BM25 ile devam edebilir (embedding, BM25'e EK bir katman,
-// zorunlu bağımlılık değil).
-export function makeMindmapEmbeddingRetriever(): EmbeddingRetriever {
-  if (!localDocuments || !localEmbeddings) {
-    throw new Error(
-      "Embedding listesi henüz oluşturulmadı (Ollama kullanılamamış olabilir). " +
-      "makeMindmapEmbeddingRetriever() çağrılmadan önce docIngestNodeMindmap() " +
-      "başarıyla çalışmış olmalı."
-    );
-  }
-  return new EmbeddingRetriever(localDocuments, localEmbeddings, 8);
-}
-
 
 // ============================================================================
-// PARAGRAF YÖNETİCİSİ
+// PARAGRAF YÖNETİCİSİ (module-private, saf fonksiyonlar)
 // ----------------------------------------------------------------------------
 // reconstructParagraphs: PDF'ten çıkan ham metin genelde satır satır
 // KIRILMIŞ olur (PDF'in kendi sayfa/satır düzeninden dolayı, gerçek
@@ -127,9 +98,13 @@ export function makeMindmapEmbeddingRetriever(): EmbeddingRetriever {
 //     "rinde" = "birinde"), tireyi kaldırıp birleştir
 //   - Bunların hiçbiri değilse -> normal bir devam satırı, mevcut paragrafa ekle
 //
-// Her paragrafın metnine başına "[Sayfa N]" etiketi ekleniyor — bu etiket,
-// projenin başka yerlerinde (mapNode, expandItemsNode) sayfa numarasını
-// metinden geri çıkarmak için kullanılıyor (regex ile: /\[Sayfa (\d+)\]/).
+// Her paragrafın metnine başına "[Sayfa N]" etiketi ekleniyor (bkz.
+// extractPageNumber, bu etiketi geri okuyan paylaşılan yardımcı).
+//
+// Bu fonksiyon (ve loadPDFs) hem girdisini parametre olarak alıp hem de
+// paylaşılan bir state'e dokunmadan yeni bir değer döndürdüğü için (saf),
+// MindmapRagStore'un bir metoduna çevrilmiyor — module-private fonksiyon
+// olarak kalması "this" plumbing'i eklemeden aynı işi görüyor.
 // ============================================================================
 function reconstructParagraphs(rawText: string, source: string, pageNumber: number): Document[] {
   const paragraphs: Document<any>[] = [];
@@ -138,6 +113,24 @@ function reconstructParagraphs(rawText: string, source: string, pageNumber: numb
   let currentParagraph = ""; // Şu an inşa edilmekte olan paragraf metni
   let paragraphIndex = 0;    // Bu sayfadaki paragrafların sıra numarası (0, 1, 2, ...)
 
+  // flush: o ana kadar biriken paragrafı (varsa) paragraphs listesine ekler
+  // ve sıfırlar. Aşağıdaki 3 farklı "yeni paragraf başlat" durumunda
+  // (boş satır / madde işareti / kısa başlık) tekrarlanan aynı push+reset
+  // bloğunun tek yeri.
+  const flush = (type: "paragraph" | "heading" = "paragraph", text: string = currentParagraph) => {
+    if (text.trim()) {
+      paragraphs.push({
+        pageContent: `[Sayfa ${pageNumber}] ${text.trim()}`,
+        metadata: {
+          source,
+          page: pageNumber,
+          paragraph_id: paragraphIndex++,
+          type
+        }
+      });
+    }
+  };
+
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const trimmedLine = line.trim();
@@ -145,62 +138,23 @@ function reconstructParagraphs(rawText: string, source: string, pageNumber: numb
 
     // Boş satır = paragraf sonu
     if (trimmedLine === "") {
-      if (currentParagraph.trim()) {
-        paragraphs.push({
-          pageContent: `[Sayfa ${pageNumber}] ${currentParagraph.trim()}`,
-          metadata: {
-            source,
-            page: pageNumber,
-            paragraph_id: paragraphIndex++,
-            type: "paragraph"
-          }
-        });
-        currentParagraph = "";
-      }
+      flush();
+      currentParagraph = "";
       continue;
     }
 
     // Madde işareti = yeni paragraf
     if (/^[-•*]\s/.test(trimmedLine) || /^\d+[.)]\s/.test(trimmedLine)) {
-      if (currentParagraph.trim()) {
-        paragraphs.push({
-          pageContent: `[Sayfa ${pageNumber}] ${currentParagraph.trim()}`,
-          metadata: {
-            source,
-            page: pageNumber,
-            paragraph_id: paragraphIndex++,
-            type: "paragraph"
-          }
-        });
-        currentParagraph = "";
-      }
+      flush();
       currentParagraph = trimmedLine;
       continue;
     }
 
     // Çok kısa satır (başlık olabilir) = yeni paragraf
     if (trimmedLine.length < 50 && trimmedLine.length > 0 && /^[A-ZÇĞİÖŞÜ]/.test(trimmedLine)) {
-      if (currentParagraph.trim()) {
-        paragraphs.push({
-          pageContent: `[Sayfa ${pageNumber}] ${currentParagraph.trim()}`,
-          metadata: {
-            source,
-            page: pageNumber,
-            paragraph_id: paragraphIndex++,
-            type: "paragraph"
-          }
-        });
-        currentParagraph = "";
-      }
-      paragraphs.push({
-        pageContent: `[Sayfa ${pageNumber}] ${trimmedLine}`,
-        metadata: {
-          source,
-          page: pageNumber,
-          paragraph_id: paragraphIndex++,
-          type: "heading"
-        }
-      });
+      flush();
+      currentParagraph = "";
+      flush("heading", trimmedLine);
       continue;
     }
 
@@ -215,36 +169,25 @@ function reconstructParagraphs(rawText: string, source: string, pageNumber: numb
   }
 
   // Son paragrafı ekle
-  if (currentParagraph.trim()) {
-    paragraphs.push({
-      pageContent: `[Sayfa ${pageNumber}] ${currentParagraph.trim()}`,
-      metadata: {
-        source,
-        page: pageNumber,
-        paragraph_id: paragraphIndex++,
-        type: "paragraph"
-      }
-    });
-  }
+  flush();
 
   return paragraphs;
 }
 
-// loadPDFs: Verilen dosya yollarındaki (filePaths) TÜM PDF'leri sırayla açar,
-// her birinin her sayfasını reconstructParagraphs ile paragraflara böler ve
-// hepsini TEK bir düz listede (allParagraphs) toplar.
+// loadPDFs: Verilen dosya yollarındaki (filePaths) TÜM PDF'leri PARALEL
+// olarak açar (birbirinden bağımsız dosya I/O'ları), her birinin her
+// sayfasını reconstructParagraphs ile paragraflara böler ve hepsini TEK bir
+// düz listede toplar.
 //
 // Bir PDF yüklenirken hata olursa (ör. bozuk dosya), try/catch sayesinde
-// SADECE o dosya atlanır — diğer PDF'ler yine de işlenmeye devam eder.
+// SADECE o dosya atlanır (boş dizi döner) — diğer PDF'ler yine de işlenir.
 async function loadPDFs(filePaths: string[]): Promise<Document[]> {
-  const allParagraphs: Document[] = [];
-
-  for (const filePath of filePaths) {
+  const perFileParagraphs = await Promise.all(filePaths.map(async filePath => {
     try {
       const loader = new PDFLoader(filePath);
       const pages = await loader.load(); // pages: her biri bir sayfanın { pageContent, metadata } objesi
 
-      // Her sayfayı paragraflara ayır
+      const paragraphs: Document[] = [];
       for (const page of pages) {
         // PDF Loader'ın sayfa numarasını sakladığı alan sürüme göre değişebiliyor
         // (loc.pageNumber / page / pageNumber). Hangisi doluysa onu kullan.
@@ -257,85 +200,133 @@ async function loadPDFs(filePaths: string[]): Promise<Document[]> {
           pageNumber = page.metadata.pageNumber;
         }
 
-        const paragraphs = reconstructParagraphs(page.pageContent, filePath, pageNumber);
-        allParagraphs.push(...paragraphs);
+        paragraphs.push(...reconstructParagraphs(page.pageContent, filePath, pageNumber));
       }
+      return paragraphs;
 
     } catch (error: any) {
       console.error(`✗ ${filePath} yüklenemedi:`, error.message);
+      return [];
     }
-  }
-  return allParagraphs;
+  }));
+
+  return perFileParagraphs.flat();
 }
 
-// Doküman ingest node - Mindmap için
-export async function docIngestNodeMindmap(state: any) {
-  console.log("PDF INGEST NODE (Mindmap - BM25 + yerel embedding hibrit arama)");
+// ============================================================================
+// MindmapRagStore
+// ----------------------------------------------------------------------------
+// PDF paragraflarını ve embedding vektörlerini tutan, BM25/embedding
+// retriever'ları üreten sınıf. ESKİDEN bu state modül seviyesinde
+// (let localDocuments/localEmbeddings) tutuluyordu — bu, aynı process
+// içinde iki pipeline çalışması üst üste binerse (ör. bir sunucuda eşzamanlı
+// istek), birinin diğerinin dokümanlarını sessizce ezmesine yol açabilecek
+// bir concurrency riskiydi. Artık her MindmapRagStore instance'ı kendi
+// documents/embeddings alanlarını taşıyor — her pipeline çalıştırması kendi
+// store instance'ını oluşturduğu sürece (bkz. MindmapPipeline), bu risk
+// ortadan kalkıyor.
+// ============================================================================
+export class MindmapRagStore {
+  private documents: Document[] | null = null;
+  private embeddings: number[][] | null = null; // documents ile aynı sırada, aynı uzunlukta
 
-  // ESKİDEN tek bir sabit dosya adı vardı: "./documents/FransaSolidarizm.pdf".
-  // Kullanıcı kendi PDF'ini yükleyebilsin diye, artık documents/ klasöründeki
-  // TÜM .pdf dosyaları otomatik olarak bulunup işleniyor.
-  const documentsDir = "./documents";
-  let pdfPaths: string[] = [];
-  try {
-    pdfPaths = readdirSync(documentsDir)
-      .filter(f => f.toLowerCase().endsWith(".pdf"))
-      .map(f => path.join(documentsDir, f));
-  } catch (error: any) {
-    console.warn(`"${documentsDir}" klasörü okunamadı:`, error.message);
-  }
+  constructor(private embeddingClient: OllamaEmbeddingClient = new OllamaEmbeddingClient()) {}
 
-  if (pdfPaths.length === 0) {
-    console.warn(`"${documentsDir}" klasöründe PDF bulunamadı.`);
-    return state;
-  }
+  // ingest: documentsDir klasöründeki TÜM .pdf dosyalarını okur, paragraflara
+  // ayırır, this.documents'i doldurur; ardından (opsiyonel) her paragrafın
+  // embedding'ini yerel Ollama'dan hesaplayıp this.embeddings'i doldurur.
+  // Ollama o an çalışmıyorsa/model kurulu değilse, sadece uyarı verip
+  // embeddings'i null bırakır — pipeline BM25 ile (embedding'siz) çalışmaya
+  // devam eder, çökmez (bkz. getEmbeddingRetriever ve rag_tool_citation.ts'teki
+  // try/catch).
+  async ingest(documentsDir: string = "./documents"): Promise<Document[]> {
+    console.log("PDF INGEST (Mindmap - BM25 + yerel embedding hibrit arama)");
 
-  console.log(`İşlenecek PDF(ler): ${pdfPaths.join(", ")}`);
-
-  // PDF'leri yükle ve paragraflara ayır
-  const paragraphs = await loadPDFs(pdfPaths);
-
-  if (paragraphs.length === 0) {
-    console.warn("Hiçbir PDF paragrafı yüklenemedi!");
-    return state;
-  }
-
-  console.log(`${paragraphs.length} paragraf çıkarıldı, bellekteki listeye ekleniyor...`);
-
-  // Paragrafları modül seviyesindeki listeye yükle (bkz. makeMindmapRetriever).
-  localDocuments = paragraphs;
-
-  console.log(`✓ ${paragraphs.length} paragraf belleğe eklendi.`);
-
-  // ---- Embedding hesapla (yerel Ollama üzerinden) ----
-  // Bu adım OPSİYONEL: Ollama o an çalışmıyorsa ya da model kurulu değilse,
-  // sadece uyarı verip localEmbeddings'i null bırakıyoruz — pipeline BM25 ile
-  // (embedding'siz) çalışmaya devam eder, çökmez (bkz.
-  // makeMindmapEmbeddingRetriever ve rag_tool_citation.ts'teki try/catch).
-  try {
-    console.log("Embedding'ler hesaplanıyor (yerel Ollama, nomic-embed-text)...");
-    const embeddingClient = new OllamaEmbeddingClient();
-    const EMBED_BATCH_SIZE = 64; // Tek istekte gönderilecek paragraf sayısı
-    const embeddings: number[][] = [];
-
-    for (let i = 0; i < paragraphs.length; i += EMBED_BATCH_SIZE) {
-      const batch = paragraphs.slice(i, i + EMBED_BATCH_SIZE);
-      const batchVectors = await embeddingClient.embed(batch.map(d => d.pageContent));
-      embeddings.push(...batchVectors);
+    // ESKİDEN tek bir sabit dosya adı vardı: "./documents/FransaSolidarizm.pdf".
+    // Kullanıcı kendi PDF'ini yükleyebilsin diye, artık documentsDir
+    // klasöründeki TÜM .pdf dosyaları otomatik olarak bulunup işleniyor.
+    let pdfPaths: string[] = [];
+    try {
+      pdfPaths = (await readdir(documentsDir))
+        .filter(f => f.toLowerCase().endsWith(".pdf"))
+        .map(f => path.join(documentsDir, f));
+    } catch (error: any) {
+      console.warn(`"${documentsDir}" klasörü okunamadı:`, error.message);
     }
 
-    localEmbeddings = embeddings;
-    console.log(`✓ ${embeddings.length} embedding hesaplandı.`);
-  } catch (error: any) {
-    console.warn(
-      "⚠️ Embedding hesaplanamadı (Ollama çalışmıyor olabilir), sadece BM25 ile devam edilecek:",
-      error.message
-    );
-    localEmbeddings = null;
+    if (pdfPaths.length === 0) {
+      console.warn(`"${documentsDir}" klasöründe PDF bulunamadı.`);
+      return [];
+    }
+
+    console.log(`İşlenecek PDF(ler): ${pdfPaths.join(", ")}`);
+
+    // PDF'leri yükle ve paragraflara ayır
+    const paragraphs = await loadPDFs(pdfPaths);
+
+    if (paragraphs.length === 0) {
+      console.warn("Hiçbir PDF paragrafı yüklenemedi!");
+      return [];
+    }
+
+    console.log(`${paragraphs.length} paragraf çıkarıldı, belleğe ekleniyor...`);
+    this.documents = paragraphs;
+    console.log(`✓ ${paragraphs.length} paragraf belleğe eklendi.`);
+
+    // ---- Embedding hesapla (yerel Ollama üzerinden) ----
+    // Batch'ler birbirinden bağımsız olduğu için PARALEL gönderiliyor.
+    try {
+      console.log("Embedding'ler hesaplanıyor (yerel Ollama, nomic-embed-text)...");
+      const EMBED_BATCH_SIZE = 64; // Tek istekte gönderilecek paragraf sayısı
+
+      const batches: string[][] = [];
+      for (let i = 0; i < paragraphs.length; i += EMBED_BATCH_SIZE) {
+        batches.push(paragraphs.slice(i, i + EMBED_BATCH_SIZE).map(d => d.pageContent));
+      }
+
+      // Promise.all sonuçları, promise'lerin verildiği SIRAYLA döner (bitiş
+      // sırasıyla değil), bu yüzden .flat() sonrası embeddings[i] hâlâ
+      // paragraphs[i]'ye karşılık geliyor.
+      const batchResults = await Promise.all(batches.map(batch => this.embeddingClient.embed(batch)));
+      const embeddings = batchResults.flat();
+
+      this.embeddings = embeddings;
+      console.log(`✓ ${embeddings.length} embedding hesaplandı.`);
+    } catch (error: any) {
+      console.warn(
+        "⚠️ Embedding hesaplanamadı (Ollama çalışmıyor olabilir), sadece BM25 ile devam edilecek:",
+        error.message
+      );
+      this.embeddings = null;
+    }
+
+    return paragraphs;
   }
 
-  return {
-    ...state,
-    documents: paragraphs
-  };
+  // getBM25Retriever: ingest() henüz çalışmadıysa (documents boşsa) fırlatır.
+  getBM25Retriever(): BM25Retriever {
+    if (!this.documents) {
+      throw new Error(
+        "Paragraf listesi henüz oluşturulmadı. getBM25Retriever() çağrılmadan önce " +
+        "ingest() çalışıp PDF'leri işlemiş olmalı."
+      );
+    }
+    return new BM25Retriever(this.documents);
+  }
+
+  // getEmbeddingRetriever: embeddings hesaplanamadıysa (ör. Ollama o an
+  // çalışmıyorsa) fırlatır; çağıran taraf (rag_tool_citation.ts) bunu
+  // yakalayıp sadece BM25 ile devam edebilir (embedding, BM25'e EK bir
+  // katman, zorunlu bağımlılık değil). this.embeddingClient'ı (ingest()'in
+  // embedding hesaplarken kullandığı AYNI istemciyi) yeniden kullanır —
+  // gereksiz ikinci bir Ollama istemcisi kurmaz.
+  getEmbeddingRetriever(): EmbeddingRetriever {
+    if (!this.documents || !this.embeddings) {
+      throw new Error(
+        "Embedding listesi henüz oluşturulmadı (Ollama kullanılamamış olabilir). " +
+        "getEmbeddingRetriever() çağrılmadan önce ingest() başarıyla çalışmış olmalı."
+      );
+    }
+    return new EmbeddingRetriever(this.documents, this.embeddings, this.embeddingClient);
+  }
 }

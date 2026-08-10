@@ -14,14 +14,18 @@
 // bu genişletilmiş sorgu BM25'e verilince, tek başına orijinal metnin
 // bulamayacağı paragrafları da yakalama ihtimali artar.
 //
-// Tüm maddeler TEK bir (ya da birkaç, gruplar halinde) istekte işlenir —
-// her madde için ayrı bir LLM çağrısı yapmak hem yavaş hem pahalı olurdu.
+// Tüm maddeler gruplar halinde (BATCH_SIZE), PARALEL isteklerle işlenir —
+// her madde için ayrı bir LLM çağrısı yapmak hem yavaş hem pahalı olurdu,
+// tüm grupları SIRAYLA göndermek de gereksiz yavaş olurdu (gruplar
+// birbirinden bağımsız).
 // ============================================================================
 import { getAzureChatModel } from "../Utils/helper.js";
 
 // extractJson: LLM'in cevabından (bazen ```json ... ``` gibi kod bloğuna
-// sarılı gelebilir) JSON objesini çıkarır.
-function extractJson(raw: string): string {
+// sarılı gelebilir) JSON objesini çıkarır. Export edilmiş — rag_tool_citation.ts
+// da LLM cevaplarından JSON çıkarırken aynı mantığı kullanıyor, ikinci bir
+// kopya yazmak yerine bunu paylaşıyor.
+export function extractJson(raw: string): string {
   const start = raw.indexOf('{');
   const end = raw.lastIndexOf('}');
   if (start === -1 || end === -1 || end < start) {
@@ -42,8 +46,14 @@ export async function expandQueriesBatch(items: string[]): Promise<Map<string, s
   const llm = getAzureChatModel({ temperature: 0.2, maxTokens: 1500 });
   const BATCH_SIZE = 12;
 
+  const batches: string[][] = [];
   for (let i = 0; i < items.length; i += BATCH_SIZE) {
-    const batch = items.slice(i, i + BATCH_SIZE);
+    batches.push(items.slice(i, i + BATCH_SIZE));
+  }
+
+  // Gruplar birbirinden bağımsız olduğu için PARALEL gönderiliyor; her grup
+  // kendi try/catch'i içinde, biri başarısız olsa diğerlerini etkilemiyor.
+  const batchResults = await Promise.all(batches.map(async (batch, batchIdx) => {
     const listText = batch.map((item, idx) => `${idx}: ${item}`).join('\n');
 
     const prompt = `You are a search query expansion assistant. For each numbered Turkish text below, list 3-5 ADDITIONAL Turkish search keywords (synonyms, word variants, closely related concepts) that would help find matching passages about the SAME topic in a source document. Do not repeat words already in the text.
@@ -57,15 +67,18 @@ Respond with ONLY a single JSON object, no other text, no markdown fences, match
     try {
       const res = await llm.invoke(prompt);
       const parsed = JSON.parse(extractJson(res.content)) as Record<string, string[]>;
-      batch.forEach((item, idx) => {
+      return batch.map((item, idx): [string, string[]] => {
         const keywords = parsed[String(idx)];
-        result.set(item, Array.isArray(keywords) ? keywords : []);
+        return [item, Array.isArray(keywords) ? keywords : []];
       });
     } catch (error: any) {
-      console.warn(`⚠️ Sorgu genişletme başarısız oldu (madde ${i}-${i + batch.length - 1}), bu maddeler genişletme olmadan aranacak:`, error.message);
-      batch.forEach(item => result.set(item, []));
+      const start = batchIdx * BATCH_SIZE;
+      console.warn(`⚠️ Sorgu genişletme başarısız oldu (madde ${start}-${start + batch.length - 1}), bu maddeler genişletme olmadan aranacak:`, error.message);
+      return batch.map((item): [string, string[]] => [item, []]);
     }
-  }
+  }));
+
+  batchResults.flat().forEach(([item, keywords]) => result.set(item, keywords));
 
   return result;
 }

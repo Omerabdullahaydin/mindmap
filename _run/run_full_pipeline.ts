@@ -10,7 +10,7 @@
 // hiçbir LLM çağrısı yapmıyor, sadece pipeline'ı başlatıp sonucu okunaklı
 // bir şekilde terminale yazdırıyor.
 // ============================================================================
-import { mindmapCitationAgentV2 } from "./Agents/mindmap_citation_v2.js";
+import { MindmapPipeline } from "./Agents/mindmap_citation_v2.js";
 
 // Komut satırından bir konu verilmişse onu kullan (ör: npm start -- "Solidarizm"),
 // verilmemişse varsayılan olarak documents/ klasöründeki PDF'in konusuna uygun bir başlık kullan.
@@ -18,12 +18,14 @@ const topic = process.argv[2] || "Bilgisayar oyunlarının akademik başarıya e
 
 console.log(`Pipeline başlatılıyor. Konu: "${topic}"`);
 
-// .invoke({topic}): LangGraph'a "bu başlangıç durumuyla (state) baştan sona
-// çalış" der. Bu TEK satır, arka planda sırasıyla şunları tetikler:
-//   docIngestNodeMindmap -> mapNode -> reduceNode -> toolNode -> expandItemsNode
+// new MindmapPipeline(): kendi izole MindmapRagStore/CitationTool/
+// MindmapVisualizer instance'larını oluşturur. .run(topic): LangGraph'a "bu
+// başlangıç durumuyla (state) baştan sona çalış" der. Bu TEK satır, arka
+// planda sırasıyla şunları tetikler:
+//   docIngestNode -> mapNode -> reduceNode -> toolNode -> expandItemsNode
 // Her adımın çıktısı otomatik olarak bir sonrakine "state" üzerinden aktarılır
 // (bkz. mindmap_citation_v2.ts'teki MindmapStateAnnotation).
-const result = await mindmapCitationAgentV2.invoke({ topic });
+const result = await new MindmapPipeline().run(topic);
 
 // result, TÜM adımların birikmiş son durumunu (state'in son hâlini) içerir.
 // Burada sadece en çok merak edilen alanları özet olarak yazdırıyoruz.
